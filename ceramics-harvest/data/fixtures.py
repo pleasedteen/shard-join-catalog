@@ -1,12 +1,18 @@
-"""项目自带的固定数据集：三个可正常发布的版本 + 一个引用不完整的版本。
+"""项目自带的固定数据集：三个可正常发布的版本 + 一个引用不完整的版本
++ 同一发布编号补发的两个修订。
 
 数据完全确定性，不依赖外部资源。每个版本自带：
 - registry：陶片登记清单（catalog_no 唯一）
 - joins：拼接清单（a/b 为馆藏编号，无向边）
 - layouts：两个入口各自的页面排版（pipe / jsonl / record 三种）
 - broken_pages：损坏页声明（站点返回标记损坏、校验和不符的页面）
+
+馆方可沿用原发布编号补发修订：v2r2 / v2r3 仍以发布编号 "v2" 上线，
+revision 递增，只更正少数字段，大部分页面正文不变（用于验证未变页沿用）。
 """
 from __future__ import annotations
+
+import copy
 
 VERSIONS: dict[str, dict] = {
     "v1": {
@@ -115,3 +121,37 @@ VERSIONS: dict[str, dict] = {
         ],
     },
 }
+
+
+def _revised(base_key: str, revision: int, published_at: str, note: str,
+             weights: dict[str, float] | None = None,
+             join_confidence: dict[tuple[str, str], str] | None = None) -> dict:
+    """以既有发布版为底补发修订：沿用原发布编号，revision 递增，只改少数字段。"""
+    spec = copy.deepcopy(VERSIONS[base_key])
+    spec["version"] = VERSIONS[base_key].get("version", base_key)
+    spec["revision"] = revision
+    spec["published_at"] = published_at
+    spec["note"] = note
+    for catalog_no, weight in (weights or {}).items():
+        for row in spec["registry"]:
+            if row["catalog_no"] == catalog_no:
+                row["weight_g"] = weight
+    for pair, confidence in (join_confidence or {}).items():
+        for join in spec["joins"]:
+            if {join["a"], join["b"]} == set(pair):
+                join["confidence"] = confidence
+    return spec
+
+
+# 馆方沿用原发布编号 v2 补发的两个修订：
+# - v2r2：更正 C-001 重量（registry 第 0 页改动，第 1 页正文不变、排在改动页后面），
+#         上调 C-007~C-008 置信度（joins 第 1 页改动，第 0 页正文不变）。
+# - v2r3：再更正 C-002 重量（registry 第 0 页），joins 全部页面正文不变。
+VERSIONS["v2r2"] = _revised(
+    "v2", 2, "2024-09-02T09:00:00",
+    "v2 补发修订一：更正 C-001 重量，上调 C-007~C-008 拼接置信度",
+    weights={"C-001": 311.4}, join_confidence={("C-007", "C-008"): "medium"})
+VERSIONS["v2r3"] = _revised(
+    "v2r2", 3, "2024-09-20T10:00:00",
+    "v2 补发修订二：更正 C-002 重量",
+    weights={"C-002": 287.0})

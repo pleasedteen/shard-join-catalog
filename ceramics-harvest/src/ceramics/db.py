@@ -7,31 +7,39 @@ from pathlib import Path
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
+-- 发布版按 (version, revision) 区分：馆方可沿用原发布编号补发修订，
+-- 同一 version 下 revision 递增；全局至多一行 status='active'。
 CREATE TABLE IF NOT EXISTS versions(
-    version      TEXT PRIMARY KEY,
+    version      TEXT NOT NULL,
+    revision     INTEGER NOT NULL DEFAULT 1,
     status       TEXT NOT NULL CHECK(status IN ('collecting','complete','active','failed')),
     published_at TEXT,
     note         TEXT,
-    updated_at   REAL NOT NULL
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (version, revision)
 );
 
--- 已确认保存的原始页面；(version, entry, page_index) 唯一，
--- 进程重启后采集端据此跳过已确认页面继续采集。
+-- 已确认保存的原始页面；(version, revision, entry, page_index) 唯一。
+-- source='fetched' 表示本轮新抓，'carried' 表示位置与正文未变且仍完好、
+-- 从既有缓存沿用（无需重下）。进程重启后采集端据此续采。
 CREATE TABLE IF NOT EXISTS pages(
     version    TEXT NOT NULL,
+    revision   INTEGER NOT NULL DEFAULT 1,
     entry      TEXT NOT NULL CHECK(entry IN ('registry','joins')),
     page_index INTEGER NOT NULL,
     total_pages INTEGER NOT NULL,
     layout     TEXT NOT NULL,
     checksum   TEXT NOT NULL,
     body       TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'fetched' CHECK(source IN ('fetched','carried')),
     saved_at   REAL NOT NULL,
-    PRIMARY KEY (version, entry, page_index)
+    PRIMARY KEY (version, revision, entry, page_index)
 );
 
 CREATE TABLE IF NOT EXISTS version_failures(
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     version   TEXT NOT NULL,
+    revision  INTEGER NOT NULL DEFAULT 1,
     stage     TEXT NOT NULL,
     reason    TEXT NOT NULL,
     detail    TEXT,
@@ -69,6 +77,7 @@ CREATE TABLE IF NOT EXISTS revocations(
 CREATE TABLE IF NOT EXISTS activation_log(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     version TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     activated_at REAL NOT NULL
 );
 """
@@ -92,6 +101,8 @@ def init_db(db_path: str | Path) -> None:
         conn.close()
 
 
-def get_active_version(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute("SELECT version FROM versions WHERE status='active' LIMIT 1").fetchone()
-    return row["version"] if row else None
+def get_active_release(conn: sqlite3.Connection) -> tuple[str, int] | None:
+    """当前查询使用的 (发布编号, 修订)；没有完整可用版本时返回 None。"""
+    row = conn.execute("SELECT version, revision FROM versions WHERE status='active' "
+                       "LIMIT 1").fetchone()
+    return (row["version"], row["revision"]) if row else None

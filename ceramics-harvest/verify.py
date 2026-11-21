@@ -23,9 +23,10 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "data"))
 
-from ceramics.db import connect, get_active_version, init_db  # noqa: E402
+from ceramics.db import connect, get_active_release, init_db  # noqa: E402
 from ceramics.protocol import issue_token, sign  # noqa: E402
 from ceramics import query as query_mod  # noqa: E402
+from ceramics import collector as col_mod  # noqa: E402
 
 PASS, FAIL = "通过", "失败"
 results: list[tuple[str, bool, str]] = []
@@ -158,8 +159,9 @@ def main() -> int:
         print("\n== 3. 首轮采集、校验与版本激活 ==")
         rc, out = run_collector(db, base)
         conn = connect(db)
-        active = get_active_version(conn)
-        check("采集成功并激活 v1", rc == 0 and active == "v1", out.strip().splitlines()[-1])
+        active = get_active_release(conn)
+        check("采集成功并激活 v1", rc == 0 and active == ("v1", 1),
+              out.strip().splitlines()[-1])
         result = query_mod.find_sherd(conn, "C-001")
         check("查询返回陶片、连通组与发布版",
               result["version"] == "v1" and result["group_size"] == 3
@@ -194,13 +196,13 @@ def main() -> int:
         control(base, {"entry_versions": {"registry": "v2"}})  # 只切登记
         rc, out = run_collector(db, base)
         conn = connect(db)
-        check("入口版本不一致时查询仍为 v1", get_active_version(conn) == "v1",
+        check("入口版本不一致时查询仍为 v1", get_active_release(conn) == ("v1", 1),
               out.strip().splitlines()[-1])
         conn.close()
         control(base, {"entry_versions": {"joins": "v2"}})  # 拼接也切到 v2
         rc, out = run_collector(db, base)
         conn = connect(db)
-        check("两入口同属 v2 后原子激活", rc == 0 and get_active_version(conn) == "v2",
+        check("两入口同属 v2 后原子激活", rc == 0 and get_active_release(conn) == ("v2", 1),
               out.strip().splitlines()[-1])
         result = query_mod.find_sherd(conn, "C-010")
         check("v2 新陶片可查且并入 C-001 组",
@@ -224,14 +226,14 @@ def main() -> int:
         deadline = time.time() + 3
         while time.time() < deadline:  # 采集被暂停挡在门外，期间反复查询
             conn = connect(db)
-            seen_versions.add(get_active_version(conn))
+            seen_versions.add(get_active_release(conn))
             conn.close()
             time.sleep(0.1)
         bg.wait(timeout=40)
         bg_out = bg.stdout.read()
         conn = connect(db)
         check("采集窗口内查询始终是旧版 v2，采集完成后切到 v3",
-              seen_versions == {"v2"} and get_active_version(conn) == "v3",
+              seen_versions == {("v2", 1)} and get_active_release(conn) == ("v3", 1),
               f"采集中可见版本: {sorted(seen_versions)}")
         check("v3 第三种排版(record)解析正确",
               conn.execute("SELECT layout FROM pages WHERE version='v3' LIMIT 1").fetchone()[0]
@@ -247,7 +249,7 @@ def main() -> int:
             "SELECT reason, detail FROM version_failures WHERE version='v4-bad' "
             "ORDER BY id DESC LIMIT 1").fetchone()
         check("v4-bad 引用不完整被拦截，查询仍为 v3",
-              get_active_version(conn) == "v3" and fail is not None
+              get_active_release(conn) == ("v3", 1) and fail is not None
               and "X-999" in (fail["detail"] or ""),
               f"{fail['reason'] if fail else '无失败记录'}: "
               f"{fail['detail'] if fail else ''}")
@@ -262,12 +264,126 @@ def main() -> int:
             "ORDER BY id DESC LIMIT 1").fetchone()
         check("损坏页被校验和/损坏标记识别", corrupt is not None,
               corrupt["reason"] if corrupt else out.strip().splitlines()[-1])
-        check("损坏不影响当前 active(v3) 查询", get_active_version(conn) == "v3")
+        check("损坏不影响当前 active(v3) 查询", get_active_release(conn) == ("v3", 1))
         conn.close()
         control(base, {"clear_broken": True})
 
-        # 8. 进程重启断点续采：先确认部分页面落盘，再杀进程，重启后复用已确认页
-        print("\n== 8. 进程重启后复用已确认页面继续采集 ==")
+        # 8. 馆方沿用原发布编号补发修订：错时上线、收齐才切换、未变页沿用、
+        #    切换前复核、已缓存页被标坏
+        print("\n== 8. 馆方沿用原发布编号补发修订 ==")
+        db5 = str(tmp / "revision.db")
+        control(base, {"entry_versions": {"registry": "v2", "joins": "v2"}})
+        rc, out = run_collector(db5, base)
+        conn5 = connect(db5)
+        check("首次收齐 (v2, 修订1) 并激活",
+              rc == 0 and get_active_release(conn5) == ("v2", 1),
+              out.strip().splitlines()[-1])
+        conn5.close()
+
+        # 修订错时上线：只切登记入口到修订2，拼接入口仍是修订1
+        control(base, {"entry_versions": {"registry": "v2r2"}})
+        rc, out = run_collector(db5, base)
+        conn5 = connect(db5)
+        check("修订错时上线期间查询仍为 (v2, 修订1)",
+              get_active_release(conn5) == ("v2", 1),
+              out.strip().splitlines()[-1])
+        conn5.close()
+
+        # 拼接入口也补发修订2：同一修订收齐后才切换
+        control(base, {"entry_versions": {"joins": "v2r2"}})
+        rc, out = run_collector(db5, base)
+        conn5 = connect(db5)
+        check("同一修订收齐后切换到 (v2, 修订2)",
+              rc == 0 and get_active_release(conn5) == ("v2", 2),
+              out.strip().splitlines()[-1])
+        src = {}
+        for entry, idx in (("registry", 1), ("joins", 0), ("joins", 1)):
+            row = conn5.execute(
+                "SELECT source FROM pages WHERE version='v2' AND revision=2 "
+                "AND entry=? AND page_index=?", (entry, idx)).fetchone()
+            src[f"{entry}#{idx}"] = row["source"] if row else "缺失"
+        check("位置与正文未变且完好的页无需重下（即使排在改动页后面）",
+              src["registry#1"] == "carried"      # 未变页，排在改动的第 0 页后面
+              and src["joins#1"] == "fetched"     # 改动页已重抓
+              and src["joins#0"] == "fetched",    # 第 0 页是探针，每轮必取一次
+              f"registry#1={src['registry#1']}(改动页之后), joins#0={src['joins#0']}(探针), "
+              f"joins#1={src['joins#1']}(改动页)")
+        r1 = query_mod.find_sherd(conn5, "C-001")
+        check("查询返回同一发布编号及其修订，更正内容生效",
+              r1["version"] == "v2" and r1["revision"] == 2
+              and r1["sherd"]["weight_g"] == 311.4,
+              f"{r1['version']} 修订{r1['revision']}, C-001={r1['sherd']['weight_g']}g")
+        r7 = query_mod.find_sherd(conn5, "C-007")
+        edge = [e for e in r7["effective_joins"]
+                if {e["a"], e["b"]} == {"C-007", "C-008"}]
+        check("修订后的拼接置信度生效",
+              len(edge) == 1 and edge[0]["confidence"] == "medium",
+              f"C-007~C-008 confidence={edge[0]['confidence'] if edge else '无'}")
+        conn5.close()
+
+        # 切换前复核：采集收齐后站点又补发修订3，本轮不得切换
+        calls = {"n": 0}
+        orig_fetch = col_mod.SiteClient.fetch_page
+
+        def flip_before_recheck(self, entry):
+            calls["n"] += 1
+            if calls["n"] == 3:  # 前两次是两入口的采集探针，第三次是切换前复核探针
+                control(base, {"entry_versions": {"registry": "v2r3"}})
+            return orig_fetch(self, entry)
+
+        col_mod.SiteClient.fetch_page = flip_before_recheck
+        try:
+            res = col_mod.run_round(base, db5)
+        finally:
+            col_mod.SiteClient.fetch_page = orig_fetch
+        conn5 = connect(db5)
+        fail = conn5.execute(
+            "SELECT stage, reason, detail FROM version_failures "
+            "WHERE version='v2' AND revision=2 ORDER BY id DESC LIMIT 1").fetchone()
+        check("切换前复核发现站点已出新修订，本轮不切换",
+              res["activated"] is None and get_active_release(conn5) == ("v2", 2)
+              and fail is not None and fail["reason"] == "site_changed",
+              f"{fail['stage'] if fail else '无记录'}: {fail['detail'] if fail else ''}")
+        conn5.close()
+
+        # 拼接入口也到修订3后，同一修订收齐再切换
+        control(base, {"entry_versions": {"joins": "v2r3"}})
+        rc, out = run_collector(db5, base)
+        conn5 = connect(db5)
+        r2 = query_mod.find_sherd(conn5, "C-002")
+        carried3 = conn5.execute(
+            "SELECT source FROM pages WHERE version='v2' AND revision=3 "
+            "AND entry='joins' AND page_index=1").fetchone()
+        check("收齐修订3后切换，更正生效",
+              rc == 0 and get_active_release(conn5) == ("v2", 3)
+              and r2["revision"] == 3 and r2["sherd"]["weight_g"] == 287.0,
+              f"C-002={r2['sherd']['weight_g']}g")
+        check("整入口正文未变的修订沿用缓存页（joins 修订3 除探针页外未重下）",
+              carried3 is not None and carried3["source"] == "carried",
+              f"joins#1@修订3 source={carried3['source'] if carried3 else '缺失'}")
+        conn5.close()
+
+        # 已缓存页后来被标坏：报出入口和页号，查询继续用上次的完整结果
+        control(base, {"broken_pages": {"registry@v2r3": [0]}})
+        rc, out = run_collector(db5, base)
+        conn5 = connect(db5)
+        fail = conn5.execute(
+            "SELECT reason, detail FROM version_failures "
+            "WHERE version='v2' AND revision=3 ORDER BY id DESC LIMIT 1").fetchone()
+        still = query_mod.find_sherd(conn5, "C-001")
+        check("已缓存页被标坏：失败记录报出入口和页号",
+              fail is not None and fail["reason"] == "corrupt_page"
+              and "registry 第 0 页" in (fail["detail"] or ""),
+              f"{fail['reason'] if fail else '无记录'}: {fail['detail'] if fail else ''}")
+        check("查询继续用上次的完整结果",
+              get_active_release(conn5) == ("v2", 3)
+              and still["revision"] == 3 and still["group_size"] == 4,
+              f"仍是 v2 修订{still['revision']}，C-001 组 {still['group_size']} 片")
+        conn5.close()
+        control(base, {"clear_broken": True})
+
+        # 9. 进程重启断点续采：先确认部分页面落盘，再杀进程，重启后复用已确认页
+        print("\n== 9. 进程重启后复用已确认页面继续采集 ==")
         control(base, {"entry_versions": {"registry": "v2", "joins": "v2"}})
         db2 = str(tmp / "resume.db")
         # 第一步：暂停站点，启动采集——它会在暂停结束后先落盘 registry 全部页，
@@ -299,16 +415,15 @@ def main() -> int:
         conn2 = connect(db2)
         saved_after = conn2.execute("SELECT COUNT(*) c FROM pages").fetchone()["c"]
         check("重启后采集完成并激活 v2",
-              rc == 0 and get_active_version(conn2) == "v2",
+              rc == 0 and get_active_release(conn2) == ("v2", 1),
               f"页面 {saved_before} -> {saved_after}")
         check("日志显示断点跳过已保存页面", "断点续采" in out2,
               "重走入口时校验和一致即跳过")
         conn2.close()
 
-        # 9. 会话频繁过期：确定性地每隔一次请求让会话失效，验证重登+续采仍能完成
-        print("\n== 9. 会话频繁过期，自动重登并按已保存页续采 ==")
+        # 10. 会话频繁过期：确定性地每隔一次请求让会话失效，验证重登+续采仍能完成
+        print("\n== 10. 会话频繁过期，自动重登并按已保存页续采 ==")
         control(base, {"entry_versions": {"registry": "v1", "joins": "v1"}})
-        from ceramics import collector as col_mod
         db4 = str(tmp / "relogin.db")
         calls = {"n": 0}
         orig_fetch = col_mod.SiteClient.fetch_page
@@ -326,12 +441,12 @@ def main() -> int:
             col_mod.SiteClient.fetch_page = orig_fetch
         conn4 = connect(db4)
         check("频繁会话过期下重登+续采仍完成激活",
-              res.get("activated") == "v1" and get_active_version(conn4) == "v1",
+              res.get("activated") == ("v1", 1) and get_active_release(conn4) == ("v1", 1),
               f"期间翻页调用 {calls['n']} 次，每次失效都未重复抓取已确认页")
         conn4.close()
 
-        # 10. HTTP 查询服务冒烟
-        print("\n== 10. HTTP 查询服务 ==")
+        # 11. HTTP 查询服务冒烟
+        print("\n== 11. HTTP 查询服务 ==")
         qport = free_port()
         qsrv = subprocess.Popen(
             [sys.executable, "-m", "ceramics.query", "serve", "--db", db,
@@ -347,9 +462,9 @@ def main() -> int:
                         break
                 except urllib.error.URLError:
                     time.sleep(0.1)
-            check("GET /find 返回 JSON 与发布版",
+            check("GET /find 返回 JSON 与发布版及修订",
                   qdata is not None and qdata.get("version") == "v3"
-                  and qdata.get("query") == "C-001",
+                  and qdata.get("revision") == 1 and qdata.get("query") == "C-001",
                   f"组大小 {qdata.get('group_size') if qdata else '无响应'}")
             code, gdata = http("GET", f"http://127.0.0.1:{qport}/groups")
             check("GET /groups 返回连通组清单", code == 200 and "groups" in gdata,

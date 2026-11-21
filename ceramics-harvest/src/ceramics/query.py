@@ -1,8 +1,9 @@
-"""查询服务：按当前 active 发布版返回陶片及其拼接连通组，支持撤销/恢复拼接。
+"""查询服务：按当前 active (发布版, 修订) 返回陶片及其拼接连通组，支持撤销/恢复拼接。
 
 - 有效拼接 = 该发布版 joins 去掉本发布版 revocations；撤销后原一组自动拆成多组，
   由图遍历实时计算（自动成环也安全）。
-- 查询结果带发布版编号，明确数据来自哪一版。
+- 每次查询返回同一份完整资料及其修订：结果带发布编号与修订号，明确数据来自哪一版
+  哪一次修订；采集/复核期间查询始终命中上一个完整结果。
 - 没有任何 active 版本时明确报错，不猜测数据。
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from ceramics.db import connect, get_active_version, init_db
+from ceramics.db import connect, get_active_release, init_db
 
 EFFECTIVE_EDGES_SQL = """
 SELECT j.edge_key, j.a, j.b, j.bond, j.confidence
@@ -39,13 +40,14 @@ def _load_graph(conn: sqlite3.Connection, version: str) -> tuple[dict, dict]:
 
 
 def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
-    version = get_active_version(conn)
-    if not version:
+    active = get_active_release(conn)
+    if not active:
         raise LookupError("尚无完整可用的发布版，查询未开放")
+    version, revision = active
     sherd = conn.execute("SELECT * FROM sherds WHERE version=? AND catalog_no=?",
                          (version, catalog_no)).fetchone()
     if not sherd:
-        raise LookupError(f"馆藏编号 {catalog_no} 不在当前发布版 {version} 中")
+        raise LookupError(f"馆藏编号 {catalog_no} 不在当前发布版 {version} 修订{revision} 中")
     adj, edges = _load_graph(conn, version)
     group, visited_edges = [], set()
     queue = deque([catalog_no])
@@ -66,8 +68,10 @@ def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
     return {
         "query": catalog_no,
         "version": version,
+        "revision": revision,
         "published_at": conn.execute(
-            "SELECT published_at FROM versions WHERE version=?", (version,)).fetchone()[0],
+            "SELECT published_at FROM versions WHERE version=? AND revision=?",
+            (version, revision)).fetchone()[0],
         "sherd": dict(sherd),
         "group_size": len(members),
         "group": members,
@@ -76,9 +80,10 @@ def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
 
 
 def revoke_join(conn: sqlite3.Connection, a: str, b: str, reason: str = "") -> dict:
-    version = get_active_version(conn)
-    if not version:
+    active = get_active_release(conn)
+    if not active:
         raise LookupError("尚无完整可用的发布版")
+    version, _ = active
     from ceramics.protocol import edge_key
     key = edge_key(a, b)
     row = conn.execute("SELECT * FROM joins WHERE version=? AND edge_key=?",
@@ -95,9 +100,10 @@ def revoke_join(conn: sqlite3.Connection, a: str, b: str, reason: str = "") -> d
 
 
 def restore_join(conn: sqlite3.Connection, a: str, b: str) -> dict:
-    version = get_active_version(conn)
-    if not version:
+    active = get_active_release(conn)
+    if not active:
         raise LookupError("尚无完整可用的发布版")
+    version, _ = active
     from ceramics.protocol import edge_key
     key = edge_key(a, b)
     cur = conn.execute("DELETE FROM revocations WHERE version=? AND edge_key=?",
@@ -109,9 +115,10 @@ def restore_join(conn: sqlite3.Connection, a: str, b: str) -> dict:
 
 
 def list_groups(conn: sqlite3.Connection) -> dict:
-    version = get_active_version(conn)
-    if not version:
+    active = get_active_release(conn)
+    if not active:
         raise LookupError("尚无完整可用的发布版，查询未开放")
+    version, revision = active
     adj, _ = _load_graph(conn, version)
     nodes = [r["catalog_no"] for r in conn.execute(
         "SELECT catalog_no FROM sherds WHERE version=? ORDER BY catalog_no", (version,))]
@@ -130,24 +137,28 @@ def list_groups(conn: sqlite3.Connection) -> dict:
                     queue.append(link["to"])
         groups.append(sorted(component))
     groups.sort(key=lambda g: g[0])
-    return {"version": version, "group_count": len(groups), "groups": groups}
+    return {"version": version, "revision": revision,
+            "group_count": len(groups), "groups": groups}
 
 
 def status(conn: sqlite3.Connection) -> dict:
-    version = get_active_version(conn)
-    out = {"active_version": version, "revisions": [], "history": []}
-    if version:
+    active = get_active_release(conn)
+    out = {"active_version": None, "active_revision": None, "revisions": [], "history": []}
+    if active:
+        version, revision = active
+        out["active_version"] = version
+        out["active_revision"] = revision
         out["revisions"] = [dict(r) for r in conn.execute(
             "SELECT edge_key, reason, revoked_at FROM revocations WHERE version=? ORDER BY id",
             (version,))]
         out["history"] = [dict(r) for r in conn.execute(
-            "SELECT version, activated_at FROM activation_log ORDER BY id")]
+            "SELECT version, revision, activated_at FROM activation_log ORDER BY id")]
     return out
 
 
 def _print_find(result: dict) -> None:
     print(f"查询编号: {result['query']}  |  数据发布版: {result['version']} "
-          f"({result['published_at']})")
+          f"修订{result['revision']} ({result['published_at']})")
     s = result["sherd"]
     print(f"陶片: {s['catalog_no']}  馆藏: {s['museum']}  材质: {s['material']}  "
           f"重量: {s['weight_g']}g")

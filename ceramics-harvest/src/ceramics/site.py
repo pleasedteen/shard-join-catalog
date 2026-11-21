@@ -2,10 +2,14 @@
 
 行为覆盖需求中的全部站点故障与协议特性：
 - 两个入口 /registry 和 /joins 可在*不同时间*切到不同发布版（控制接口单独设置）。
+- 馆方可沿用原发布编号补发修订：同一 version 以递增 revision 重新上线，
+  两个入口同样可能错时切到修订。
 - 会话有 TTL，过期后返回 401；站点可暂停受理，暂停期返回 503 + Retry-After 恢复时间。
 - 翻页令牌按会话访问顺序发放，令牌绑定会话与游标；新会话无法使用旧令牌。
 - 请求签名随会话 secret 和令牌变化。
 - 页面排版按发布版变化（pipe/jsonl/record 三种），个别页可声明为损坏页。
+- 每页响应带整份页面清单(manifest)：各页校验和与损坏标记，采集端据此判断
+  哪些页位置与正文未变且仍完好（无需重下），哪些页缺失/已改动（需要补抓）。
 """
 from __future__ import annotations
 
@@ -65,12 +69,13 @@ class SiteState:
 STATE = SiteState()
 
 
-def _page_payload(entry: str, version: str, index: int) -> dict:
-    spec = VERSIONS[version]
+def _page_payload(entry: str, spec_key: str, index: int) -> dict:
+    spec = VERSIONS[spec_key]
     size = spec["page_size"][entry]
     rows = spec[entry][index * size:(index + 1) * size]
     total = (len(spec[entry]) + size - 1) // size
-    broken = index in STATE.broken_pages.get((entry, version), [])
+    broken_set = set(STATE.broken_pages.get((entry, spec_key), []))
+    broken = index in broken_set
     if broken:
         # 损坏页：内容被截断、校验和按完好内容计算，必然对不上
         body = _format_page(rows, spec["layouts"][entry])
@@ -79,15 +84,24 @@ def _page_payload(entry: str, version: str, index: int) -> dict:
     else:
         body = _format_page(rows, spec["layouts"][entry])
         checksum = page_checksum(rows)
+    # 整份页面清单：采集端凭它比对已缓存页，位置与正文未变且仍完好的页无需重下
+    manifest = [
+        {"page_index": i,
+         "checksum": page_checksum(spec[entry][i * size:(i + 1) * size]),
+         "corrupted": i in broken_set}
+        for i in range(total)
+    ]
     return {
         "entry": entry,
-        "version": version,
+        "version": spec.get("version", spec_key),   # 发布编号：补发修订时沿用原编号
+        "revision": spec.get("revision", 1),        # 同一发布编号下的修订序号
         "page_index": index,
         "total_pages": total,
         "layout": spec["layouts"][entry],
         "published_at": spec["published_at"],
         "corrupted": broken,
         "checksum": checksum,
+        "manifest": manifest,
         "body": body,
     }
 
@@ -228,8 +242,8 @@ class Handler(BaseHTTPRequestHandler):
 
         entry = parsed.path.lstrip("/")
         with STATE.lock:
-            version = STATE.entry_versions[entry]
-        payload = _page_payload(entry, version, cursor)
+            spec_key = STATE.entry_versions[entry]
+        payload = _page_payload(entry, spec_key, cursor)
         payload["next_token"] = next_token
         self._send(200, payload)
 
