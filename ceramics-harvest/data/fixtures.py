@@ -5,8 +5,13 @@
 - joins：拼接清单（a/b 为馆藏编号，无向边）
 - layouts：两个入口各自的页面排版（pipe / jsonl / record 三种）
 - broken_pages：损坏页声明（站点返回标记损坏、校验和不符的页面）
+
+设置环境变量 CERAMICS_BIG_LEDGER=1 时额外挂载 2 万 / 8 万大册版本（见 big_fixtures），
+普通运行不加载大册，保持模拟站轻量。
 """
 from __future__ import annotations
+
+import os
 
 VERSIONS: dict[str, dict] = {
     "v1": {
@@ -115,3 +120,9 @@ VERSIONS: dict[str, dict] = {
         ],
     },
 }
+
+# 按需挂载大册（2 万 / 8 万）：仅模拟站进程需要，采集与查询进程不加载。
+if os.environ.get("CERAMICS_BIG_LEDGER") == "1":
+    from big_fixtures import build_big_versions
+
+    VERSIONS.update(build_big_versions())

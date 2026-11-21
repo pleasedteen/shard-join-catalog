@@ -3,6 +3,13 @@ from __future__ import annotations
 
 import json
 
+# 固定页大小：生产排版每页 500 条业务记录。采集、写库分块与大册 fixtures 都以此为准，
+# 使进程峰值内存只取决于单页大小而不是整版总量。
+PAGE_SIZE = 500
+# 单个采集写事务最多覆盖两页业务记录（500 * 2 = 1000 行）。
+MAX_PAGES_PER_WRITE_TXN = 2
+MAX_BUSINESS_ROWS_PER_TXN = PAGE_SIZE * MAX_PAGES_PER_WRITE_TXN
+
 REGISTRY_FIELDS = ("catalog_no", "museum", "material", "weight_g")
 JOIN_FIELDS = ("a", "b", "bond", "confidence")
 

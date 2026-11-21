@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS versions(
 
 -- 已确认保存的原始页面；(version, entry, page_index) 唯一，
 -- 进程重启后采集端据此跳过已确认页面继续采集。
+-- record_count 为该页解析出的业务记录数：重启后只按页数+校验和+记录数复用，
+-- 不必重新解析整版即可确认业务行（sherds/joins）已随该页同事务入库。
 CREATE TABLE IF NOT EXISTS pages(
     version    TEXT NOT NULL,
     entry      TEXT NOT NULL CHECK(entry IN ('registry','joins')),
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS pages(
     layout     TEXT NOT NULL,
     checksum   TEXT NOT NULL,
     body       TEXT NOT NULL,
+    record_count INTEGER NOT NULL DEFAULT 0,
     saved_at   REAL NOT NULL,
     PRIMARY KEY (version, entry, page_index)
 );
@@ -71,6 +74,10 @@ CREATE TABLE IF NOT EXISTS activation_log(
     version TEXT NOT NULL,
     activated_at REAL NOT NULL
 );
+
+-- 校验期按版流式扫描的常用路径（pages/sherds/joins 主键已覆盖 version 前缀，
+-- 这里补一个失败排查与状态查询用的页面计数索引）。
+CREATE INDEX IF NOT EXISTS idx_pages_version_entry ON pages(version, entry);
 """
 
 
@@ -87,6 +94,10 @@ def init_db(db_path: str | Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # 旧库迁移：pages 早期没有 record_count 列，补齐后由后续采页/校验自然回填
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(pages)")}
+        if "record_count" not in cols:
+            conn.execute("ALTER TABLE pages ADD COLUMN record_count INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()

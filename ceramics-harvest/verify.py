@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -99,13 +100,36 @@ def authed_get(base: str, sess: dict, path: str, token: str | None = None) -> tu
     })
 
 
-def run_collector(db: str, base: str) -> tuple[int, str]:
+def run_collector(db: str, base: str, extra_env: dict | None = None,
+                  metrics_file: str | None = None) -> tuple[int, str]:
     env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    if extra_env:
+        env.update(extra_env)
+    if metrics_file:
+        env["CERAMICS_METRICS_FILE"] = metrics_file
     proc = subprocess.run(
         [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
          "--base-url", base, "--rounds", "1"],
-        cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
     return proc.returncode, proc.stdout + proc.stderr
+
+
+def start_collector(db: str, base: str, extra_env: dict | None = None,
+                    metrics_file: str | None = None) -> subprocess.Popen:
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    if extra_env:
+        env.update(extra_env)
+    if metrics_file:
+        env["CERAMICS_METRICS_FILE"] = metrics_file
+    return subprocess.Popen(
+        [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
+         "--base-url", base, "--rounds", "1"],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def read_metrics(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def main() -> int:
@@ -113,7 +137,9 @@ def main() -> int:
     db = str(tmp / "ceramics.db")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
-    env = dict(os.environ, PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}")
+    # 模拟站按需挂载 2 万/8 万大册；采集与查询进程不设置该变量，保持轻量
+    env = dict(os.environ, PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}",
+               CERAMICS_BIG_LEDGER="1")
     server = subprocess.Popen(
         [sys.executable, "-m", "ceramics.site", "--port", str(port)],
         cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -330,8 +356,184 @@ def main() -> int:
               f"期间翻页调用 {calls['n']} 次，每次失效都未重复抓取已确认页")
         conn4.close()
 
+        # 11. 大册资源对比：2 万 -> 8 万（固定每页 500 条），峰值内存最多翻倍、
+        #     单事务业务行 <= 1000（两页），且整版校验期间查询与撤销不中断
+        print("\n== 10. 大册 2 万 -> 8 万：内存与写事务资源对比 ==")
+        from ceramics import collector as col_mod
+        from ceramics.parsing import PAGE_SIZE as FIXED_PAGE_SIZE
+
+        big_env = dict(PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}")
+        big_runs: dict[str, dict] = {}
+        for tag, total, layout in (("v-big-20k", 20_000, "jsonl"),
+                                   ("v-big-80k", 80_000, "record")):
+            control(base, {"entry_versions": {"registry": tag, "joins": tag}})
+            bdb = str(tmp / f"{tag}.db")
+            mfile = str(tmp / f"{tag}.metrics.json")
+            t0 = time.time()
+            rc, bout = run_collector(bdb, base, extra_env=big_env, metrics_file=mfile)
+            elapsed = time.time() - t0
+            metrics = read_metrics(mfile)
+            bconn = connect(bdb)
+            active = get_active_version(bconn)
+            sherd_n = bconn.execute(
+                "SELECT COUNT(*) c FROM sherds WHERE version=?", (tag,)).fetchone()["c"]
+            join_n = bconn.execute(
+                "SELECT COUNT(*) c FROM joins WHERE version=?", (tag,)).fetchone()["c"]
+            page_n = bconn.execute(
+                "SELECT COUNT(*) c FROM pages WHERE version=?", (tag,)).fetchone()["c"]
+            big_runs[tag] = {"metrics": metrics, "elapsed": elapsed,
+                             "sherd_n": sherd_n, "join_n": join_n, "page_n": page_n,
+                             "active": active, "rc": rc, "out": bout}
+            bconn.close()
+            print(f"  {tag}: {sherd_n} 登记 / {join_n} 拼接 / {page_n} 页, "
+                  f"耗时 {elapsed:.1f}s, 峰值 RSS {metrics['peak_rss_kb']} KB, "
+                  f"写事务 {metrics['write_txn_count']} 个, "
+                  f"单事务最多 {metrics['max_business_rows_per_txn']} 行业务记录")
+
+        m20, m80 = big_runs["v-big-20k"]["metrics"], big_runs["v-big-80k"]["metrics"]
+        check("大册固定每页 500 条，两版单页记录数都不超限",
+              m20["max_records_per_page"] <= FIXED_PAGE_SIZE
+              and m80["max_records_per_page"] <= FIXED_PAGE_SIZE
+              and FIXED_PAGE_SIZE == 500,
+              f"2 万版单页最多 {m20['max_records_per_page']} 条 / "
+              f"8 万版 {m80['max_records_per_page']} 条，上限 {FIXED_PAGE_SIZE}")
+        check("单个采集写事务至多写两页（1000 条）业务记录",
+              m20["max_business_rows_per_txn"] <= 1000
+              and m80["max_business_rows_per_txn"] <= 1000,
+              f"2 万版峰值 {m20['max_business_rows_per_txn']} 行/事务, "
+              f"8 万版 {m80['max_business_rows_per_txn']} 行/事务；"
+              f"8 万版事务行数分布 {m80['txn_histogram']}")
+        # 80k 页数是 20k 的 4 倍，但每个写事务规模不变（事务数约 4 倍而非变大）
+        check("整版扩 4 倍时写事务数量约增 4 倍、单事务规模不膨胀",
+              m80["write_txn_count"] >= 3 * m20["write_txn_count"]
+              and m80["max_business_rows_per_txn"] <= m20["max_business_rows_per_txn"] + 10,
+              f"写事务 {m20['write_txn_count']} -> {m80['write_txn_count']} 个")
+        # 核心资源指标：整版 4 倍，采集进程峰值内存最多翻倍（留 2 MiB 测量裕量）
+        rss_ratio = m80["peak_rss_kb"] / max(m20["peak_rss_kb"], 1)
+        rss_ok = m80["peak_rss_kb"] <= m20["peak_rss_kb"] * 2 + 2048
+        check("整版 2 万 -> 8 万，采集到切版的 Python 峰值内存最多翻倍",
+              rss_ok,
+              f"峰值 RSS {m20['peak_rss_kb']} KB -> {m80['peak_rss_kb']} KB，"
+              f"比值 {rss_ratio:.2f}x（要求 <= 2.0x）")
+        check("两个大册均收齐、校验成功并整体激活",
+              big_runs["v-big-20k"]["active"] == "v-big-20k"
+              and big_runs["v-big-80k"]["active"] == "v-big-80k"
+              and big_runs["v-big-20k"]["sherd_n"] == 20_000
+              and big_runs["v-big-80k"]["sherd_n"] == 80_000,
+              f"页数 {big_runs['v-big-20k']['page_n']} / "
+              f"{big_runs['v-big-80k']['page_n']}")
+
+        # 整版校验期间查询不中断、可提交当前版撤销：后台跑 8 万版流式校验，
+        # 前台在同一库上反复查询并撤销/恢复一条当前版拼接
+        print("\n== 11. 整版校验期间查询与复核撤销不中断，及大册中断恢复 ==")
+        db80 = str(tmp / "v-big-80k.db")
+        conn80 = connect(db80)
+        validation_holder: dict = {}
+
+        def run_long_validation() -> None:
+            c = connect(db80)
+            try:
+                validation_holder["ok"], validation_holder["reason"] = \
+                    col_mod.validate_version(c, "v-big-80k")
+            finally:
+                c.close()
+
+        vthread = threading.Thread(target=run_long_validation)
+        vthread.start()
+        time.sleep(0.05)  # 确保校验线程已进入逐页扫描
+        edge_a, edge_b = "B-000000", "B-000001"
+        # 校验线程仍在跑时提交撤销写事务：WAL 下读不阻写，若校验误持写锁，
+        # 这里会抛锁等待/只读异常。撤销后连通组应立即拆分，随后恢复。
+        lock_error = None
+        try:
+            query_mod.revoke_join(conn80, edge_a, edge_b, reason="大册校验期复核撤销")
+            # 撤销的是长链第一条边：B-000000 应立即变为孤立点，B-000001 带着剩余长链
+            isolated = query_mod.find_sherd(conn80, edge_a)
+            revoked_isolated_size = isolated["group_size"]
+            chain_rest = query_mod.find_sherd(conn80, edge_b)
+            revoked_chain_size = chain_rest["group_size"]
+            still_visible = isolated["version"]
+            query_mod.restore_join(conn80, edge_a, edge_b)
+            restored = query_mod.find_sherd(conn80, edge_a)["group_size"]
+        except sqlite3.OperationalError as exc:
+            lock_error = repr(exc)
+            revoked_isolated_size, revoked_chain_size, restored = -1, -1, -1
+            still_visible = None
+        vthread.join(timeout=30)
+        check("整版校验全程可查询当前 active 版",
+              lock_error is None and still_visible == "v-big-80k",
+              f"校验期查询版本 {still_visible}, 锁错误 {lock_error}")
+        check("整版校验期间可提交当前版撤销并实时拆分连通组",
+              lock_error is None and revoked_isolated_size == 1
+              and revoked_chain_size == 39_999 and restored == 40_000
+              and validation_holder.get("ok") is True,
+              f"撤销后 B-000000 组 {revoked_isolated_size} / 长链余组 "
+              f"{revoked_chain_size}，恢复后 {restored}，校验 {validation_holder}")
+        conn80.close()
+
+        # 大册中断恢复：8 万版采到一半杀进程，重启后复用已解析入库的页面
+        control(base, {"entry_versions": {"registry": "v-big-20k", "joins": "v-big-20k"}})
+        db_resume = str(tmp / "big-resume.db")
+        control(base, {"pause_seconds": 3})
+        killed = start_collector(db_resume, base, extra_env=big_env)
+        cwait = connect(db_resume)
+        deadline = time.time() + 20
+        saved_before = 0
+        reg_pages = join_pages = 0
+        while time.time() < deadline:
+            try:
+                reg_pages = cwait.execute(
+                    "SELECT COUNT(*) c FROM pages WHERE entry='registry'").fetchone()["c"]
+                join_pages = cwait.execute(
+                    "SELECT COUNT(*) c FROM pages WHERE entry='joins'").fetchone()["c"]
+            except sqlite3.OperationalError:
+                time.sleep(0.2)
+                continue
+            # registry 已收齐、joins 进行到一半再杀：两个入口都留下已确认页面
+            if reg_pages >= 40 and join_pages >= 10:
+                saved_before = reg_pages + join_pages
+                break
+            time.sleep(0.2)
+        # 再确认业务行与页面是同事务成对落盘的
+        biz_before = cwait.execute(
+            "SELECT (SELECT COUNT(*) FROM sherds) + (SELECT COUNT(*) FROM joins) c"
+        ).fetchone()["c"]
+        cwait.close()
+        killed.kill()
+        killed.wait()
+        check("大册中断前 registry 已齐、joins 过半且业务记录同事务落盘",
+              saved_before >= 50 and biz_before > 0,
+              f"已保存 {reg_pages} registry + {join_pages} joins 页 / {biz_before} 行业务记录")
+
+        mfile_r = str(tmp / "big-resume.metrics.json")
+        rc, rout = run_collector(db_resume, base, extra_env=big_env,
+                                 metrics_file=mfile_r)
+        rmetrics = read_metrics(mfile_r)
+        cfin = connect(db_resume)
+        saved_after = cfin.execute("SELECT COUNT(*) c FROM pages").fetchone()["c"]
+        expected_pages = cfin.execute(
+            "SELECT SUM(total_pages) s FROM (SELECT DISTINCT entry, total_pages FROM pages)"
+        ).fetchone()["s"]
+        sherd_total = cfin.execute(
+            "SELECT COUNT(*) c FROM sherds WHERE version='v-big-20k'").fetchone()["c"]
+        # 断点续采的翻页请求：每入口只重取 1 个探针页 + 此前缺口页，已保存页不再请求
+        expected_fetches = expected_pages - saved_before + 2
+        check("重启后收齐全部页面并整体激活 2 万大册",
+              rc == 0 and get_active_version(cfin) == "v-big-20k"
+              and saved_after == expected_pages and sherd_total == 20_000,
+              f"页面 {saved_before} -> {saved_after}/{expected_pages}, 登记 {sherd_total} 条")
+        check("重启复用已解析入库页面，不重复抓取已确认页",
+              rmetrics["fetch_count"] == expected_fetches
+              and "断点续采" in rout,
+              f"重启后翻页请求 {rmetrics['fetch_count']} 次（期望 {expected_fetches}）")
+        check("续采进程单事务仍不超过两页业务记录",
+              rmetrics["max_business_rows_per_txn"] <= 1000
+              and rmetrics["max_records_per_page"] <= FIXED_PAGE_SIZE,
+              f"单事务峰值 {rmetrics['max_business_rows_per_txn']} 行")
+        cfin.close()
+
         # 10. HTTP 查询服务冒烟
-        print("\n== 10. HTTP 查询服务 ==")
+        print("\n== 12. HTTP 查询服务 ==")
         qport = free_port()
         qsrv = subprocess.Popen(
             [sys.executable, "-m", "ceramics.query", "serve", "--db", db,
