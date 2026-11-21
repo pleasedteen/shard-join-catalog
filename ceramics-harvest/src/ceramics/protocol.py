@@ -44,5 +44,15 @@ def page_checksum(records: list[dict]) -> str:
 
 
 def edge_key(a: str, b: str) -> str:
-    """无向拼接边的规范键，避免 (A,B)/(B,A) 重复。"""
+    """馆内无向拼接边的规范键，避免 (A,B)/(B,A) 重复。"""
     return "~".join(sorted((a, b)))
+
+
+def node_key(site: str, catalog_no: str) -> str:
+    """跨馆图中节点的规范键：馆藏编号在不同馆之间可能重号，必须带馆标识。"""
+    return f"{site}|{catalog_no}"
+
+
+def cross_edge_key(site_a: str, a: str, site_b: str, b: str) -> str:
+    """跨馆拼接边的规范键（无向，按节点键排序去重）。"""
+    return "~".join(sorted((node_key(site_a, a), node_key(site_b, b))))

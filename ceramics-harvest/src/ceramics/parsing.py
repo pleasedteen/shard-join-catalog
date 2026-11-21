@@ -1,4 +1,8 @@
-"""三种页面排版的解析器，把模拟站页面正文还原为记录列表。"""
+"""三种页面排版的解析器，把模拟站页面正文还原为记录列表。
+
+拼接清单里出现 "馆名:馆藏编号" 形式时表示跨馆引用；登记清单的馆藏编号
+在本馆内唯一，但不同馆之间允许相同。
+"""
 from __future__ import annotations
 
 import json
@@ -16,7 +20,27 @@ def _coerce(row: dict, fields: tuple[str, ...], entry: str) -> dict:
             row["weight_g"] = float(row["weight_g"])
         except (TypeError, ValueError):
             raise ValueError(f"登记页 weight_g 不是数字: {row.get('weight_g')!r}")
+    else:
+        row["a"] = str(row["a"]).strip()
+        row["b"] = str(row["b"]).strip()
+        if not row["a"] or not row["b"]:
+            raise ValueError("拼接记录两端编号不能为空")
     return {f: row[f] for f in fields}
+
+
+def split_endpoint(value: str, local_site: str) -> tuple[str, str]:
+    """把拼接端点解析为 (site, catalog_no)。
+
+    不带前缀的编号属于*本馆*；"site:编号" 显式指向某馆。这样跨馆登记
+    不会与本馆重号陶片混淆。
+    """
+    if ":" in value:
+        site, catalog_no = value.split(":", 1)
+        site, catalog_no = site.strip(), catalog_no.strip()
+        if not site or not catalog_no:
+            raise ValueError(f"跨馆端点格式错误: {value!r}")
+        return site, catalog_no
+    return local_site, value
 
 
 def parse_page(entry: str, layout: str, body: str) -> list[dict]:

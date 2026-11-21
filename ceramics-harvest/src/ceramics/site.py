@@ -1,11 +1,13 @@
-"""本地模拟站：合作馆陶片登记/拼接清单发布服务。
+"""本地模拟站：多合作馆陶片登记/拼接清单发布服务。
 
-行为覆盖需求中的全部站点故障与协议特性：
-- 两个入口 /registry 和 /joins 可在*不同时间*切到不同发布版（控制接口单独设置）。
-- 会话有 TTL，过期后返回 401；站点可暂停受理，暂停期返回 503 + Retry-After 恢复时间。
+一个进程同时模拟多个合作馆，每个馆是一个独立站点：
+- 路径前缀 /<site>/... 标识馆；每个馆的登记 /registry 与拼接 /joins 两个入口，
+  各自可在不同时间切到不同发布版（控制接口按馆单独设置）。
+- 每个馆有独立的会话空间、暂停状态、损坏页声明；一馆暂停不影响其它馆。
+- 会话有 TTL，过期返回 401；暂停期返回 503 + Retry-After 恢复时间。
 - 翻页令牌按会话访问顺序发放，令牌绑定会话与游标；新会话无法使用旧令牌。
 - 请求签名随会话 secret 和令牌变化。
-- 页面排版按发布版变化（pipe/jsonl/record 三种），个别页可声明为损坏页。
+- 页面排版按发布版变化（pipe/jsonl/record），个别页可声明为损坏页。
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from ceramics.protocol import issue_token, page_checksum, read_token, sign
-from fixtures import VERSIONS
+from fixtures import SITES
 
 CONTROL_KEY = "ceramics-local-control"
 ENTRIES = ("registry", "joins")
@@ -38,62 +40,76 @@ def _format_page(records: list[dict], layout: str) -> str:
     raise ValueError(f"未知排版: {layout}")
 
 
-class SiteState:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        # 两个入口各自的当前发布版，初始都在 v1
-        self.entry_versions = {"registry": "v1", "joins": "v1"}
-        # sid -> {"secret", "cursor", "expires_at"}
+class SiteRuntime:
+    """单个合作馆的运行状态。"""
+
+    def __init__(self, site: str, spec: dict) -> None:
+        self.site = site
+        self.spec = spec
+        self.versions = spec["versions"]
+        initial = spec.get("initial_version", "v1")
+        self.entry_versions = {"registry": initial, "joins": initial}
         self.sessions: dict[str, dict] = {}
         self.paused_until = 0.0
         self.session_ttl = 20.0
-        # {(entry, version): [损坏页序号...]}，验证脚本可现场制造损坏
         self.broken_pages: dict[tuple[str, str], list[int]] = {}
+
+    def page_payload(self, entry: str, version: str, index: int) -> dict:
+        spec = self.versions[version]
+        size = spec["page_size"][entry]
+        rows = spec[entry][index * size:(index + 1) * size]
+        total = (len(spec[entry]) + size - 1) // size
+        broken = index in self.broken_pages.get((entry, version), [])
+        body = _format_page(rows, spec["layouts"][entry])
+        checksum = page_checksum(rows)
+        if broken:
+            # 损坏页：内容被截断、校验和按完好内容计算，必然对不上
+            body = body[: max(10, len(body) // 2)] + "\n### PAGE CORRUPTED ###"
+        return {
+            "site": self.site,
+            "entry": entry,
+            "version": version,
+            "page_index": index,
+            "total_pages": total,
+            "layout": spec["layouts"][entry],
+            "published_at": spec["published_at"],
+            "corrupted": broken,
+            "checksum": checksum,
+            "body": body,
+        }
+
+    def snapshot(self) -> dict:
+        return {
+            "site": self.site,
+            "entry_versions": dict(self.entry_versions),
+            "paused": time.time() < self.paused_until,
+            "paused_until": self.paused_until,
+            "session_ttl": self.session_ttl,
+            "active_sessions": len(self.sessions),
+            "broken_pages": {f"{k[0]}@{k[1]}": v for k, v in self.broken_pages.items()},
+        }
+
+
+class SiteState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.runtimes: dict[str, SiteRuntime] = {
+            site: SiteRuntime(site, spec) for site, spec in SITES.items()
+        }
+
+    def get(self, site: str) -> SiteRuntime | None:
+        return self.runtimes.get(site)
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {
-                "entry_versions": dict(self.entry_versions),
-                "paused": time.time() < self.paused_until,
-                "paused_until": self.paused_until,
-                "session_ttl": self.session_ttl,
-                "active_sessions": len(self.sessions),
-                "broken_pages": {f"{k[0]}@{k[1]}": v for k, v in self.broken_pages.items()},
-            }
+            return {site: rt.snapshot() for site, rt in self.runtimes.items()}
 
 
 STATE = SiteState()
 
 
-def _page_payload(entry: str, version: str, index: int) -> dict:
-    spec = VERSIONS[version]
-    size = spec["page_size"][entry]
-    rows = spec[entry][index * size:(index + 1) * size]
-    total = (len(spec[entry]) + size - 1) // size
-    broken = index in STATE.broken_pages.get((entry, version), [])
-    if broken:
-        # 损坏页：内容被截断、校验和按完好内容计算，必然对不上
-        body = _format_page(rows, spec["layouts"][entry])
-        body = body[: max(10, len(body) // 2)] + "\n### PAGE CORRUPTED ###"
-        checksum = page_checksum(rows)  # 完好内容的摘要，与实际 body 不符
-    else:
-        body = _format_page(rows, spec["layouts"][entry])
-        checksum = page_checksum(rows)
-    return {
-        "entry": entry,
-        "version": version,
-        "page_index": index,
-        "total_pages": total,
-        "layout": spec["layouts"][entry],
-        "published_at": spec["published_at"],
-        "corrupted": broken,
-        "checksum": checksum,
-        "body": body,
-    }
-
-
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CeramicMock/1.0"
+    server_version = "CeramicMock/2.0"
 
     def log_message(self, *args):  # 安静运行，验证输出只保留业务信息
         pass
@@ -108,28 +124,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _paused(self) -> bool:
-        if time.time() >= STATE.paused_until:
+    def _split_site(self, path: str) -> tuple[str | None, str]:
+        """解析 /<site>/<rest>；/control、/sites 等全局路由保留原路径。"""
+        parts = path.lstrip("/").split("/", 1)
+        if len(parts) == 2 and parts[0] in STATE.runtimes:
+            return parts[0], "/" + parts[1]
+        return None, path
+
+    def _paused(self, rt: SiteRuntime) -> bool:
+        if time.time() >= rt.paused_until:
             return False
-        retry = max(1, int(STATE.paused_until - time.time()))
-        self._send(503, {"error": "site_paused", "message": "站点暂停受理，稍后恢复"},
+        retry = max(1, int(rt.paused_until - time.time()))
+        self._send(503, {"error": "site_paused", "site": rt.site,
+                         "message": f"{rt.site} 馆暂停受理，稍后恢复"},
                    {"Retry-After": retry})
         return True
 
+    def _sites_payload(self) -> dict:
+        return {"sites": [{"site": s, "name": r.spec["name"]}
+                          for s, r in sorted(STATE.runtimes.items())]}
+
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/session":
-            if self._paused():
+        site, path = self._split_site(parsed.path)
+
+        if path == "/sites":
+            self._send(200, self._sites_payload())
+            return
+
+        if path == "/session":
+            rt = STATE.get(site) if site else None
+            if rt is None:
+                self._send(404, {"error": "unknown_site"})
+                return
+            if self._paused(rt):
                 return
             length = int(self.headers.get("Content-Length", 0))
             params = parse_qs(self.rfile.read(length).decode() or "")
             if params.get("key", [""])[0] != CONTROL_KEY:
                 self._send(403, {"error": "bad_key"})
                 return
-            sid = uuid.uuid4().hex
-            secret = secrets.token_hex(16)
-            # 续采游标：采集端报告该入口已确认保存的页数，站点从该游标起
-            # 为*新会话*签发全新令牌链（不复用旧令牌，符合"新会话不能用旧令牌"）
             try:
                 resume = int(params.get("resume", ["0"])[0])
                 if resume < 0:
@@ -137,44 +171,51 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send(400, {"error": "bad_resume"})
                 return
+            sid = uuid.uuid4().hex
+            secret = secrets.token_hex(16)
             with STATE.lock:
-                STATE.sessions[sid] = {
+                rt.sessions[sid] = {
                     "secret": secret,
                     "cursor": resume,
-                    "expires_at": time.time() + STATE.session_ttl,
+                    "expires_at": time.time() + rt.session_ttl,
                 }
-            self._send(200, {"sid": sid, "secret": secret,
-                             "expires_in": STATE.session_ttl,
+            self._send(200, {"site": rt.site, "sid": sid, "secret": secret,
+                             "expires_in": rt.session_ttl,
                              "first_token": issue_token(sid, resume)})
             return
 
-        if parsed.path == "/control":
+        if path == "/control":
             if self.headers.get("X-Control-Key") != CONTROL_KEY:
                 self._send(403, {"error": "bad_control_key"})
                 return
             length = int(self.headers.get("Content-Length", 0))
             cmd = json.loads(self.rfile.read(length).decode() or "{}")
+            # 指令可带 "site": "jia" 只作用于该馆；不带则作用于全部馆。
+            targets = ([STATE.get(cmd["site"])] if cmd.get("site") in STATE.runtimes
+                       else list(STATE.runtimes.values()))
             with STATE.lock:
-                for entry in ENTRIES:
-                    if entry in cmd.get("entry_versions", {}):
-                        STATE.entry_versions[entry] = cmd["entry_versions"][entry]
-                if "pause_seconds" in cmd:
-                    STATE.paused_until = max(STATE.paused_until,
-                                             time.time() + float(cmd["pause_seconds"]))
-                if "resume" in cmd and cmd["resume"]:
-                    STATE.paused_until = time.time()
-                if "session_ttl" in cmd:
-                    STATE.session_ttl = float(cmd["session_ttl"])
-                if "expire_sessions" in cmd and cmd["expire_sessions"]:
-                    now = time.time()
-                    for sess in STATE.sessions.values():
-                        sess["expires_at"] = now
-                if "broken_pages" in cmd:
-                    for name, indexes in cmd["broken_pages"].items():
-                        entry, version = name.split("@", 1)
-                        STATE.broken_pages[(entry, version)] = list(indexes)
-                if "clear_broken" in cmd and cmd["clear_broken"]:
-                    STATE.broken_pages.clear()
+                for rt in targets:
+                    for entry in ENTRIES:
+                        if entry in cmd.get("entry_versions", {}):
+                            rt.entry_versions[entry] = cmd["entry_versions"][entry]
+                    if "pause_seconds" in cmd:
+                        rt.paused_until = max(rt.paused_until,
+                                              time.time() + float(cmd["pause_seconds"]))
+                    if cmd.get("resume"):
+                        rt.paused_until = time.time()
+                    if "session_ttl" in cmd:
+                        rt.session_ttl = float(cmd["session_ttl"])
+                    if cmd.get("expire_sessions"):
+                        now = time.time()
+                        for sess in rt.sessions.values():
+                            sess["expires_at"] = now
+                    if "broken_pages" in cmd:
+                        rt.broken_pages = {}
+                        for name, indexes in cmd["broken_pages"].items():
+                            entry, version = name.split("@", 1)
+                            rt.broken_pages[(entry, version)] = list(indexes)
+                    if cmd.get("clear_broken"):
+                        rt.broken_pages.clear()
             self._send(200, {"ok": True, "state": STATE.snapshot()})
             return
 
@@ -182,23 +223,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in ("/registry", "/joins"):
+        site, path = self._split_site(parsed.path)
+        if path == "/sites":
+            self._send(200, self._sites_payload())
+            return
+        if path not in ("/registry", "/joins") or site is None:
             self._send(404, {"error": "not_found"})
             return
-        if self._paused():
+        rt = STATE.get(site)
+        assert rt is not None
+        if self._paused(rt):
             return
 
         sid = self.headers.get("X-Ceramic-Session", "")
         token = self.headers.get("X-Ceramic-Token", "")
         signature = self.headers.get("X-Ceramic-Signature", "")
         with STATE.lock:
-            sess = STATE.sessions.get(sid)
+            sess = rt.sessions.get(sid)
             if sess is None:
                 self._send(401, {"error": "unknown_session",
                                  "message": "会话不存在，请重新登录"})
                 return
             if time.time() >= sess["expires_at"]:
-                STATE.sessions.pop(sid, None)
+                rt.sessions.pop(sid, None)
                 self._send(401, {"error": "session_expired",
                                  "message": "会话已过期，请重新登录"})
                 return
@@ -222,19 +269,18 @@ class Handler(BaseHTTPRequestHandler):
                                  "message": "令牌必须按站点发放顺序使用",
                                  "expected_cursor": sess["cursor"]})
                 return
-            # 校验通过，按访问顺序为下一页发放新令牌
             sess["cursor"] += 1
             next_token = issue_token(sid, sess["cursor"])
+            entry = path.lstrip("/")
+            version = rt.entry_versions[entry]
 
-        entry = parsed.path.lstrip("/")
-        with STATE.lock:
-            version = STATE.entry_versions[entry]
-        payload = _page_payload(entry, version, cursor)
+        payload = rt.page_payload(entry, version, cursor)
         payload["next_token"] = next_token
         self._send(200, payload)
 
 
 def serve(host: str, port: int) -> ThreadingHTTPServer:
+    ThreadingHTTPServer.daemon_threads = True
     httpd = ThreadingHTTPServer((host, port), Handler)
     return httpd
 
@@ -247,12 +293,14 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
 
-    ap = argparse.ArgumentParser(description="合作馆陶片清单本地模拟站")
+    ap = argparse.ArgumentParser(description="多合作馆陶片清单本地模拟站")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
     httpd = serve(args.host, args.port)
     print(f"模拟站已启动: http://{args.host}:{args.port}")
+    print("合作馆: " + ", ".join(
+        f"{s}({r.spec['name']})" for s, r in sorted(STATE.runtimes.items())))
     print(f"控制密钥: {CONTROL_KEY}（仅本地验证使用）")
     try:
         httpd.serve_forever()
