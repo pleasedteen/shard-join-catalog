@@ -17,11 +17,39 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from ceramics.protocol import issue_token, page_checksum, read_token, sign
+from ceramics.protocol import (
+    body_digest, issue_token, manifest_digest, page_checksum, read_token, sign)
 from fixtures import VERSIONS
 
 CONTROL_KEY = "ceramics-local-control"
 ENTRIES = ("registry", "joins")
+
+# 清单核验入口：一次请求给出该入口当前发布版的整份摘要。
+# 资料未变时采集端只需这一个响应即可判定无需重抓，流量与页数无关；
+# 需要定位差异时再带 detail=1 取逐页摘要。
+MANIFEST_PATHS = ("/registry/manifest", "/joins/manifest")
+
+
+def _manifest_payload(entry: str, version: str, detail: bool) -> dict:
+    spec = VERSIONS[version]
+    size = spec["page_size"][entry]
+    total = (len(STATE.rows(entry, version)) + size - 1) // size
+    pages = []
+    for index in range(total):
+        page = _page_payload(entry, version, index)  # 与逐页响应共用同一产物
+        pages.append({"page_index": index,
+                      "body_digest": body_digest(page["body"]),
+                      "corrupted": page["corrupted"]})
+    payload = {
+        "entry": entry,
+        "version": version,
+        "published_at": spec["published_at"],
+        "total_pages": total,
+        "digest": manifest_digest(pages),
+    }
+    if detail:
+        payload["pages"] = pages
+    return payload
 
 
 def _format_page(records: list[dict], layout: str) -> str:
@@ -49,6 +77,18 @@ class SiteState:
         self.session_ttl = 20.0
         # {(entry, version): [损坏页序号...]}，验证脚本可现场制造损坏
         self.broken_pages: dict[tuple[str, str], list[int]] = {}
+        # {(entry, version): {catalog_no: {field: value}}}，馆方在同版更正正文
+        self.corrections: dict[tuple[str, str], dict[str, dict]] = {}
+
+    def rows(self, entry: str, version: str) -> list[dict]:
+        """当前发布版的记录；同版更正按馆藏编号覆盖对应字段。"""
+        rows = [dict(r) for r in VERSIONS[version][entry]]
+        fixes = self.corrections.get((entry, version), {})
+        for row in rows:
+            key = row.get("catalog_no") or row.get("a")
+            if key in fixes:
+                row.update(fixes[key])
+        return rows
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -59,6 +99,7 @@ class SiteState:
                 "session_ttl": self.session_ttl,
                 "active_sessions": len(self.sessions),
                 "broken_pages": {f"{k[0]}@{k[1]}": v for k, v in self.broken_pages.items()},
+                "corrections": {f"{k[0]}@{k[1]}": v for k, v in self.corrections.items()},
             }
 
 
@@ -68,8 +109,9 @@ STATE = SiteState()
 def _page_payload(entry: str, version: str, index: int) -> dict:
     spec = VERSIONS[version]
     size = spec["page_size"][entry]
-    rows = spec[entry][index * size:(index + 1) * size]
-    total = (len(spec[entry]) + size - 1) // size
+    all_rows = STATE.rows(entry, version)
+    rows = all_rows[index * size:(index + 1) * size]
+    total = (len(all_rows) + size - 1) // size
     broken = index in STATE.broken_pages.get((entry, version), [])
     if broken:
         # 损坏页：内容被截断、校验和按完好内容计算，必然对不上
@@ -175,6 +217,13 @@ class Handler(BaseHTTPRequestHandler):
                         STATE.broken_pages[(entry, version)] = list(indexes)
                 if "clear_broken" in cmd and cmd["clear_broken"]:
                     STATE.broken_pages.clear()
+                if "corrections" in cmd:
+                    # {"registry@v2": {"C-006": {"weight_g": 191.2}}}：同版更正正文
+                    for name, fixes in cmd["corrections"].items():
+                        entry, version = name.split("@", 1)
+                        STATE.corrections.setdefault((entry, version), {}).update(fixes)
+                if "clear_corrections" in cmd and cmd["clear_corrections"]:
+                    STATE.corrections.clear()
             self._send(200, {"ok": True, "state": STATE.snapshot()})
             return
 
@@ -182,11 +231,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in ("/registry", "/joins"):
+        if parsed.path not in ("/registry", "/joins") + MANIFEST_PATHS:
             self._send(404, {"error": "not_found"})
             return
         if self._paused():
             return
+
+        is_manifest = parsed.path in MANIFEST_PATHS
 
         sid = self.headers.get("X-Ceramic-Session", "")
         token = self.headers.get("X-Ceramic-Token", "")
@@ -227,8 +278,19 @@ class Handler(BaseHTTPRequestHandler):
             next_token = issue_token(sid, sess["cursor"])
 
         entry = parsed.path.lstrip("/")
+        if is_manifest:
+            entry = entry.split("/", 1)[0]
         with STATE.lock:
             version = STATE.entry_versions[entry]
+        if is_manifest:
+            # 清单请求同样消耗一个令牌（按序协议一致），但不占用翻页游标之外的语义：
+            # 采集端为每个入口单独开会话，清单与逐页在同一会话内顺序使用。
+            query = parse_qs(parsed.query)
+            payload = _manifest_payload(entry, version,
+                                        query.get("detail", ["0"])[0] in ("1", "true"))
+            payload["next_token"] = next_token
+            self._send(200, payload)
+            return
         payload = _page_payload(entry, version, cursor)
         payload["next_token"] = next_token
         self._send(200, payload)

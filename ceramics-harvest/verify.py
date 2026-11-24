@@ -266,6 +266,83 @@ def main() -> int:
         conn.close()
         control(base, {"clear_broken": True})
 
+        # 7b. 坏页已在缓存中：错时切版后 joins 追平时不得把已缓存的坏页发出去
+        print("\n== 7b. 已缓存坏页在切版核验时被拦截，位置在 status 可见 ==")
+        db7 = str(tmp / "cached-bad.db")
+        control(base, {"entry_versions": {"registry": "v3", "joins": "v3"}})
+        rc, out = run_collector(db7, base)  # 独立库先激活 v3
+        control(base, {"entry_versions": {"registry": "v2", "joins": "v3"}})
+        rc, out = run_collector(db7, base)  # 只缓存 registry v2 全部页
+        control(base, {"entry_versions": {"joins": "v2"},
+                       "broken_pages": {"registry@v2": [1]}})  # 非首页坏掉，joins 追平
+        rc, out = run_collector(db7, base)
+        conn = connect(db7)
+        issue = conn.execute(
+            "SELECT version, entry, page_index FROM page_issues WHERE version='v2' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        check("已缓存坏页被拦截且不作废 v3 查询", get_active_version(conn) == "v3",
+              out.strip().splitlines()[-1])
+        check("status 异常页标明坏页在 v2/registry 第 1 页",
+              issue is not None and issue["version"] == "v2"
+              and issue["entry"] == "registry" and issue["page_index"] == 1,
+              f"{issue['version']}/{issue['entry']} 第 {issue['page_index']} 页"
+              if issue else "未记录坏页位置")
+        conn.close()
+        status_out = subprocess.run(
+            [sys.executable, "-m", "ceramics.collector", "status", "--db", db7],
+            cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
+            capture_output=True, text=True, timeout=30).stdout
+        check("status 输出包含定位到页的异常页", "registry 第 1 页" in status_out
+              and "corrupt_page" in status_out,
+              "异常页区块列出 v2 registry 第 1 页")
+
+        # 7c. 馆方同版修好坏页并更正正文：重启采集只补抓更正/缺失页
+        print("\n== 7c. 同版修复后只补抓更正页，资料不变时核验流量恒定 ==")
+        control(base, {"clear_broken": True,
+                       "corrections": {"registry@v2": {"C-006": {"weight_g": 191.2}}}})
+        from ceramics import collector as col_mod2
+        fetched = {"n": 0}
+        orig_fetch2 = col_mod2.SiteClient.fetch_page
+
+        def count_fetch(self, entry):
+            fetched["n"] += 1
+            return orig_fetch2(self, entry)
+
+        col_mod2.SiteClient.fetch_page = count_fetch
+        try:
+            res = col_mod2.run_round(base, db7)   # 追平 joins 并补上更正的 registry 第 0 页
+            # 已在位后再更正 registry 第 1 页（C-008），只应补抓这一页
+            fetched["n"] = 0
+            control(base, {"corrections": {"registry@v2": {"C-008": {"weight_g": 102.4}}}})
+            res2 = col_mod2.run_round(base, db7)
+            fetch_after_repair = fetched["n"]
+            fetched["n"] = 0
+            steady = [col_mod2.run_round(base, db7) for _ in range(4)]
+            steady_fetches = fetched["n"]
+        finally:
+            col_mod2.SiteClient.fetch_page = orig_fetch2
+        conn = connect(db7)
+        peso = conn.execute("SELECT weight_g FROM sherds WHERE version='v2' "
+                            "AND catalog_no='C-006'").fetchone()
+        peso8 = conn.execute("SELECT weight_g FROM sherds WHERE version='v2' "
+                             "AND catalog_no='C-008'").fetchone()
+        check("修复后激活 v2 且正文取馆方更正内容",
+              res.get("activated") == "v2" and res2.get("activated") == "v2"
+              and get_active_version(conn) == "v2"
+              and abs(peso["weight_g"] - 191.2) < 1e-6
+              and abs(peso8["weight_g"] - 102.4) < 1e-6,
+              f"C-006 重量 {peso['weight_g'] if peso else '无'} / "
+              f"C-008 重量 {peso8['weight_g'] if peso8 else '无'}")
+        check("只补抓被更正的页（其余沿用已确认内容）", fetch_after_repair == 1,
+              f"更正第 1 页后该轮逐页抓取 {fetch_after_repair} 页（应为 1）")
+        check("资料未变时核验不再逐页抓取，流量与页数无关", steady_fetches == 0
+              and all(s["pages_fetched"] == 0 for s in steady),
+              f"连续 {len(steady)} 轮共抓取 {steady_fetches} 页")
+        conn.close()
+        # 主库恢复站点与 v3 一致，避免影响后续场景
+        control(base, {"entry_versions": {"registry": "v3", "joins": "v3"},
+                       "clear_corrections": True})
+
         # 8. 进程重启断点续采：先确认部分页面落盘，再杀进程，重启后复用已确认页
         print("\n== 8. 进程重启后复用已确认页面继续采集 ==")
         control(base, {"entry_versions": {"registry": "v2", "joins": "v2"}})
@@ -332,21 +409,29 @@ def main() -> int:
 
         # 10. HTTP 查询服务冒烟
         print("\n== 10. HTTP 查询服务 ==")
-        qport = free_port()
-        qsrv = subprocess.Popen(
-            [sys.executable, "-m", "ceramics.query", "serve", "--db", db,
-             "--port", str(qport)], cwd=ROOT, env=env2,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        try:
+        qsrv, qdata, qport = None, None, None
+        for _attempt in range(5):
+            qport = free_port()
+            qsrv = subprocess.Popen(
+                [sys.executable, "-m", "ceramics.query", "serve", "--db", db,
+                 "--port", str(qport)], cwd=ROOT, env=env2,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             deadline = time.time() + 5
             qdata = None
             while time.time() < deadline:
+                if qsrv.poll() is not None:  # 端口被抢占等导致进程退出，换端口重试
+                    break
                 try:
                     code, qdata = http("GET", f"http://127.0.0.1:{qport}/find?catalog_no=C-001")
                     if code == 200:
                         break
                 except urllib.error.URLError:
                     time.sleep(0.1)
+            if qdata is not None and qsrv.poll() is None:
+                break
+            qsrv.terminate()
+            qsrv.wait(timeout=5)
+        try:
             check("GET /find 返回 JSON 与发布版",
                   qdata is not None and qdata.get("version") == "v3"
                   and qdata.get("query") == "C-001",

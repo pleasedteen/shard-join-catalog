@@ -38,6 +38,28 @@ CREATE TABLE IF NOT EXISTS version_failures(
     created_at REAL NOT NULL
 );
 
+-- 站点核验发现的异常页（损坏/截断等），保留页位置供 status 展示。
+CREATE TABLE IF NOT EXISTS page_issues(
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     TEXT NOT NULL,
+    entry       TEXT NOT NULL,
+    page_index  INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    detail      TEXT,
+    detected_at REAL NOT NULL
+);
+
+-- 每个入口在某发布版上最近一次完整核验的清单摘要：
+-- 摘要与页数都未变时，无需再逐页核对，核验流量不随页数增长。
+CREATE TABLE IF NOT EXISTS entry_verifications(
+    version     TEXT NOT NULL,
+    entry       TEXT NOT NULL,
+    digest      TEXT NOT NULL,
+    total_pages INTEGER NOT NULL,
+    verified_at REAL NOT NULL,
+    PRIMARY KEY (version, entry)
+);
+
 CREATE TABLE IF NOT EXISTS sherds(
     version    TEXT NOT NULL,
     catalog_no TEXT NOT NULL,

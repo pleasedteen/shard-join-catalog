@@ -2,10 +2,14 @@
 
 关键保证：
 - 503 暂停：按 Retry-After 等待后用*同一令牌*重试（暂停不消耗游标）。
-- 401 过期 / 令牌跨会话：重新登录，并从入口第一页重走；已确认保存的页面
-  校验和一致即跳过，实现进程重启后的断点续采。
+- 401 过期 / 令牌跨会话：重新登录，按已确认保存的页数续采；已确认页面
+  正文摘要一致即跳过，实现进程重启后的断点续采。
 - 登记与拼接必须同属一个发布版、页数齐全、每页校验通过、拼接引用完整，
   才在一个事务里切换 active；采集与校验期间查询继续命中旧 active 版本。
+- 切版前先取站点清单核对两份资料：清单摘要与本地已核验内容一致才发布，
+  因此"已缓存的坏页"不会被当作新内容发出去。
+- 资料未变时清单摘要不变，每轮每个入口只需一次清单请求，核验流量与页数无关；
+  摘要变化时才取逐页摘要，只补抓更正或缺失的页面。
 """
 from __future__ import annotations
 
@@ -19,10 +23,16 @@ import urllib.request
 
 from ceramics.db import connect, get_active_version, init_db
 from ceramics.parsing import parse_page
-from ceramics.protocol import edge_key, page_checksum
+from ceramics.protocol import (body_digest, edge_key, manifest_digest,
+                               page_checksum, sign)
 
 ENTRIES = ("registry", "joins")
 MAX_SESSION_RESTARTS = 100
+
+# 这些失败意味着站点资料本身不可用，需要落失败记录供操作员查看；
+# entry_switch / content_changed 只是采集中途的竞态，下一轮重试即可，不算失败。
+FAILURE_KINDS = {"corrupt_page", "parse_error", "checksum_mismatch",
+                 "verify_incomplete", "protocol", "validation_failed"}
 
 
 class SiteError(Exception):
@@ -33,7 +43,7 @@ class SiteError(Exception):
 
 
 class SessionReset(Exception):
-    """会话失效，需要重新登录并从第一页重走。"""
+    """会话失效，需要重新登录并从已确认保存的游标续采。"""
 
 
 class SiteClient:
@@ -100,7 +110,6 @@ class SiteClient:
         """取当前令牌对应的一页；暂停时原地等待重试，其它认证问题向上抛 SessionReset。"""
         path = f"/{entry}"
         while True:
-            from ceramics.protocol import sign
             signature = sign(self.secret, "GET", path, self.sid, self.token)
             try:
                 page = self._request("GET", path, headers={
@@ -116,6 +125,29 @@ class SiteClient:
             self.token = page["next_token"]
             return page
 
+    def fetch_manifest(self, entry: str, detail: bool = False) -> dict:
+        """取入口当前发布版的整份清单摘要（detail 时含逐页摘要）。
+
+        每次都用全新会话，清单请求不占用翻页游标，页序不受影响。
+        资料未变时整份摘要一次返回，核验流量与页数无关。
+        """
+        path = f"/{entry}/manifest"
+        suffix = "?detail=1" if detail else ""
+        while True:
+            self.login(resume=0)
+            signature = sign(self.secret, "GET", path, self.sid, self.token)
+            try:
+                return self._request("GET", path + suffix, headers={
+                    "X-Ceramic-Session": self.sid,
+                    "X-Ceramic-Token": self.token,
+                    "X-Ceramic-Signature": signature,
+                })
+            except SiteError as exc:
+                if exc.kind == "paused":
+                    time.sleep(exc.retry_after or 2)
+                    continue
+                raise
+
 
 def _record_failure(conn: sqlite3.Connection, version: str, stage: str,
                     reason: str, detail: str = "") -> None:
@@ -129,121 +161,224 @@ def _record_failure(conn: sqlite3.Connection, version: str, stage: str,
     conn.commit()
 
 
+def _record_page_issue(conn: sqlite3.Connection, version: str, entry: str,
+                       page_index: int, kind: str, detail: str) -> None:
+    conn.execute(
+        "INSERT INTO page_issues(version, entry, page_index, kind, detail, detected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (version, entry, page_index, kind, detail, time.time()))
+    conn.commit()
+
+
+def _clear_page_issues(conn: sqlite3.Connection, version: str, entry: str) -> None:
+    conn.execute("DELETE FROM page_issues WHERE version=? AND entry=?", (version, entry))
+
+
 def _ensure_version_row(conn: sqlite3.Connection, version: str, published_at: str,
                         note: str) -> None:
     conn.execute(
         "INSERT INTO versions(version, status, published_at, note, updated_at) "
         "VALUES (?, 'collecting', ?, ?, ?) "
-        "ON CONFLICT(version) DO UPDATE SET updated_at=excluded.updated_at",
+        "ON CONFLICT(version) DO UPDATE SET updated_at=excluded.updated_at, "
+        "status=CASE WHEN versions.status='failed' THEN 'collecting' ELSE versions.status END",
         (version, published_at, note, time.time()))
     conn.commit()
 
 
-def _saved_page_count(conn: sqlite3.Connection, entry: str, version: str | None) -> int:
-    """该入口在指定版本下已确认保存的连续页数（从 0 起）。"""
-    if not version:
-        return 0
-    rows = conn.execute(
-        "SELECT page_index FROM pages WHERE version=? AND entry=? ORDER BY page_index",
-        (version, entry)).fetchall()
-    indexes = {r["page_index"] for r in rows}
-    count = 0
-    while count in indexes:
-        count += 1
-    return count
+def _get_verification(conn: sqlite3.Connection, version: str,
+                      entry: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT digest, total_pages FROM entry_verifications WHERE version=? AND entry=?",
+        (version, entry)).fetchone()
 
 
-def walk_entry(client: SiteClient, conn: sqlite3.Connection, entry: str) -> str:
-    """完整抓取一个入口，返回该入口当前发布版；失败时记录原因并抛异常。
+def _store_verification(conn: sqlite3.Connection, version: str, entry: str,
+                        digest: str, total: int) -> None:
+    conn.execute(
+        "INSERT INTO entry_verifications(version, entry, digest, total_pages, verified_at) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(version, entry) DO UPDATE SET "
+        "digest=excluded.digest, total_pages=excluded.total_pages, "
+        "verified_at=excluded.verified_at",
+        (version, entry, digest, total, time.time()))
+    conn.commit()
 
-    续采策略：
-    - 版本未知时用探针会话取第 0 页确认发布版并落盘；
-    - 之后按该版本已确认保存的页数作为游标登录，站点为新会话从该游标签发新令牌；
-    - 续采中会话失效只按当前已保存页数重登重试，不重新探针、不复用旧令牌、不重复抓页。
+
+def _local_body_digests(conn: sqlite3.Connection, version: str,
+                        entry: str) -> dict[int, str]:
+    return {r["page_index"]: body_digest(r["body"]) for r in conn.execute(
+        "SELECT page_index, body FROM pages WHERE version=? AND entry=?",
+        (version, entry))}
+
+
+def _validate_and_store(conn: sqlite3.Connection, entry: str, version: str,
+                        page: dict, expected_digest: str | None) -> bool:
+    """校验一页并落盘（缺失则新增、更正则覆盖），返回内容是否有变化。"""
+    page_index = page["page_index"]
+    if page["version"] != version:
+        raise SiteError("entry_switch",
+                        f"入口 {entry} 采集中从 {version} 切到 {page['version']}，本轮作废")
+    if page.get("corrupted"):
+        detail = f"{entry} 第 {page_index} 页被站点标记为损坏（发布版 {version}）"
+        _record_page_issue(conn, version, entry, page_index, "corrupt_page", detail)
+        raise SiteError("corrupt_page", detail)
+    try:
+        records = parse_page(entry, page["layout"], page["body"])
+    except ValueError as exc:
+        detail = f"{entry} 第 {page_index} 页解析失败: {exc}"
+        _record_page_issue(conn, version, entry, page_index, "parse_error", detail)
+        raise SiteError("parse_error", detail)
+    if page_checksum(records) != page["checksum"]:
+        detail = f"{entry} 第 {page_index} 页校验和不符，内容不可用"
+        _record_page_issue(conn, version, entry, page_index, "checksum_mismatch", detail)
+        raise SiteError("checksum_mismatch", detail)
+    actual = body_digest(page["body"])
+    if expected_digest is not None and actual != expected_digest:
+        raise SiteError("content_changed",
+                        f"{entry} 第 {page_index} 页在清单核验后发生变化，等待下一轮")
+    saved = conn.execute(
+        "SELECT body FROM pages WHERE version=? AND entry=? AND page_index=?",
+        (version, entry, page_index)).fetchone()
+    if saved is not None and body_digest(saved["body"]) == actual:
+        return False
+    conn.execute(
+        "INSERT INTO pages(version, entry, page_index, total_pages, layout,"
+        " checksum, body, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(version, entry, page_index) DO UPDATE SET "
+        "total_pages=excluded.total_pages, layout=excluded.layout, "
+        "checksum=excluded.checksum, body=excluded.body, saved_at=excluded.saved_at",
+        (version, entry, page_index, page["total_pages"], page["layout"],
+         page["checksum"], page["body"], time.time()))
+    conn.commit()
+    return True
+
+
+def _fetch_page_at(client: SiteClient, entry: str, index: int) -> dict:
+    """用全新会话从指定游标取该页（清单已定位差异页，无需从第 0 页重走）。"""
+    client.login(resume=index)
+    return client.fetch_page(entry)
+
+
+def sync_entry(client: SiteClient, conn: sqlite3.Connection, entry: str,
+               summary: dict) -> tuple[str, bool]:
+    """把某入口与站点当前发布版对齐；返回 (版本, 是否有内容变化)。
+
+    先取整份清单摘要：与上次核验一致且本地页齐全时，不逐页核验（流量与页数无关）。
+    摘要变化时才取逐页摘要，只补抓缺失页与正文被更正的页；发现损坏页即记录位置并
+    放弃该版，查询继续使用旧版本。
     """
     restarts = 0
-    version: str | None = None
-    total_pages = 0
+    recorded_version: dict[str, str] = {}
+
+    def once() -> tuple[str, bool]:
+        manifest = client.fetch_manifest(entry)
+        summary["manifests_fetched"] += 1
+        version = manifest["version"]
+        recorded_version["version"] = version
+        try:
+            return _sync_entry_once(client, conn, entry, version, manifest, summary)
+        except SiteError as exc:
+            if exc.kind in FAILURE_KINDS:
+                # 同一版每轮只记一次失败，避免重试把同一原因刷屏
+                _record_failure(conn, version, f"verify:{entry}", exc.kind, str(exc))
+            raise
+
     while True:
         if restarts > MAX_SESSION_RESTARTS:
             raise SiteError("restart_limit", "会话重建次数超限")
         try:
-            if version is None:
-                # 第一阶段：探针会话取第 0 页，确定入口当前发布版
-                client.login(resume=0)
-                probe = client.fetch_page(entry)
-                if probe["page_index"] != 0:
-                    raise SiteError("protocol", "探针页序号应为 0")
-                version = probe["version"]
-                total_pages = probe["total_pages"]
-                _ensure_version_row(conn, version, probe["published_at"], "")
-                _save_or_verify_page(conn, entry, probe)
-
-            # 第二阶段：按已保存页数续采；失效重登后也从这里继续，无需重新探针
-            resume = _saved_page_count(conn, entry, version)
-            if total_pages == 0:
-                row = conn.execute(
-                    "SELECT MIN(total_pages) t FROM pages WHERE version=? AND entry=?",
-                    (version, entry)).fetchone()
-                total_pages = row["t"] or 0
-            if resume >= total_pages:
-                print(f"  · {entry} 发布版 {version} 的 {total_pages} 页均已确认，整入口跳过")
-                return version
-            client.login(resume=resume)
-            page_index = resume
-            while True:
-                page = client.fetch_page(entry)
-                if page["version"] != version:
-                    # 采集中入口切版：本轮作废，下一轮从新版第 0 页重新探针
-                    raise SiteError(
-                        "entry_switch",
-                        f"入口 {entry} 采集中从 {version} 切到 {page['version']}，本轮作废")
-                if page["page_index"] != page_index:
-                    raise SiteError("protocol",
-                                    f"页序号不连续：期望 {page_index}，实际 {page['page_index']}")
-                _save_or_verify_page(conn, entry, page)
-                page_index += 1
-                if page_index >= total_pages:
-                    return version
+            return once()
         except SessionReset as exc:
             restarts += 1
             print(f"  ! 会话失效（{exc}），按已确认保存页数重新登录后续采，不重复抓取")
-            continue
-        except SiteError as exc:
-            if version:
-                _record_failure(conn, version, f"walk:{entry}", exc.kind, str(exc))
-            raise
 
 
-def _save_or_verify_page(conn: sqlite3.Connection, entry: str, page: dict) -> None:
-    """校验单页并落盘；已存在且校验和一致则跳过，不一致则报错。"""
-    page_index = page["page_index"]
-    version = page["version"]
-    if page.get("corrupted"):
-        raise SiteError("corrupt_page",
-                        f"{entry} 第 {page_index} 页被站点标记为损坏")
-    try:
-        records = parse_page(entry, page["layout"], page["body"])
-    except ValueError as exc:
-        raise SiteError("parse_error", f"{entry} 第 {page_index} 页解析失败: {exc}")
-    if page_checksum(records) != page["checksum"]:
-        raise SiteError("checksum_mismatch",
-                        f"{entry} 第 {page_index} 页校验和不符，内容不可用")
-    saved = conn.execute(
-        "SELECT checksum FROM pages WHERE version=? AND entry=? AND page_index=?",
-        (version, entry, page_index)).fetchone()
-    if saved is None:
-        conn.execute(
-            "INSERT INTO pages(version, entry, page_index, total_pages, layout,"
-            " checksum, body, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (version, entry, page_index, page["total_pages"], page["layout"],
-             page["checksum"], page["body"], time.time()))
+def _sync_entry_once(client: SiteClient, conn: sqlite3.Connection, entry: str,
+                     version: str, manifest: dict,
+                     summary: dict) -> tuple[str, bool]:
+    total = manifest["total_pages"]
+    _ensure_version_row(conn, version, manifest["published_at"], "")
+    # 页数变少时清理越界旧页，避免旧页被算进完整性校验
+    conn.execute(
+        "DELETE FROM pages WHERE version=? AND entry=? AND page_index >= ?",
+        (version, entry, total))
+    conn.commit()
+
+    cached = _get_verification(conn, version, entry)
+    local = _local_body_digests(conn, version, entry)
+    missing = [i for i in range(total) if i not in local]
+    if (cached and cached["digest"] == manifest["digest"]
+            and cached["total_pages"] == total and not missing):
+        # 资料自上次完整核验后未变：一次清单请求即完成核验，无需逐页抓取
+        _store_verification(conn, version, entry, manifest["digest"], total)
+        _clear_page_issues(conn, version, entry)
         conn.commit()
-    elif saved["checksum"] != page["checksum"]:
-        raise SiteError("checksum_mismatch",
-                        f"{entry} 第 {page_index} 页与已保存内容不一致")
-    else:
-        print(f"  · 跳过已确认保存的 {entry} 第 {page_index} 页（断点续采）")
+        print(f"  · {entry} 发布版 {version} 资料未变（清单摘要一致），"
+              f"{total} 页沿用已确认保存内容，跳过逐页核验（断点续采）")
+        return version, False
+
+    detail = client.fetch_manifest(entry, detail=True)
+    summary["manifests_fetched"] += 1
+    if detail["version"] != version or detail["digest"] != manifest["digest"]:
+        raise SiteError("entry_switch", f"入口 {entry} 核验期间发布内容变化，本轮作废")
+    pages = {p["page_index"]: p for p in detail["pages"]}
+    if sorted(pages) != list(range(total)):
+        raise SiteError("protocol", f"{entry} 清单页序号不完整")
+
+    to_fetch: list[int] = []
+    corrupt_details: list[str] = []
+    for index in range(total):
+        spec = pages[index]
+        if spec["corrupted"]:
+            detail_txt = f"{entry} 第 {index} 页被站点标记为损坏（发布版 {version}）"
+            _record_page_issue(conn, version, entry, index, "corrupt_page", detail_txt)
+            corrupt_details.append(detail_txt)
+            continue
+        if local.get(index) == spec["body_digest"]:
+            print(f"  · 跳过已确认保存的 {entry} 第 {index} 页（断点续采）")
+            continue
+        to_fetch.append(index)
+    if corrupt_details:
+        # 坏页位置已逐个写入 page_issues / status；本版整份不可发布，查询继续用旧版
+        raise SiteError("corrupt_page", "；".join(corrupt_details))
+
+    changed = False
+    for index in to_fetch:
+        page = _fetch_page_at(client, entry, index)
+        summary["pages_fetched"] += 1
+        if page["page_index"] != index:
+            raise SiteError("protocol",
+                            f"{entry} 页序号不连续：期望 {index}，实际 {page['page_index']}")
+        if _validate_and_store(conn, entry, version, page, pages[index]["body_digest"]):
+            changed = True
+            print(f"  · 已保存 {entry} 第 {index} 页（补抓更正/缺失页）")
+
+    local = _local_body_digests(conn, version, entry)
+    for index in range(total):
+        if local.get(index) != pages[index]["body_digest"]:
+            raise SiteError("verify_incomplete", f"{entry} 第 {index} 页未完成核验")
+
+    _store_verification(conn, version, entry, manifest["digest"], total)
+    _clear_page_issues(conn, version, entry)
+    conn.commit()
+    return version, changed
+
+
+def confirm_snapshot(client: SiteClient, conn: sqlite3.Connection, version: str,
+                     summary: dict) -> tuple[bool, str]:
+    """切版前核对两份资料：站点当前清单必须与本地已核验内容逐字节一致。"""
+    for entry in ENTRIES:
+        manifest = client.fetch_manifest(entry)
+        summary["manifests_fetched"] += 1
+        if manifest["version"] != version:
+            return False, (f"{entry} 在切版前切换到 {manifest['version']}，"
+                           f"等待两入口同版后再激活")
+        local = _local_body_digests(conn, version, entry)
+        local_pages = [{"page_index": i, "body_digest": d, "corrupted": False}
+                       for i, d in sorted(local.items())]
+        if (len(local_pages) != manifest["total_pages"]
+                or manifest_digest(local_pages) != manifest["digest"]):
+            return False, f"{entry} 站点资料在核验后变化，等待下一轮重新核验后再切换"
+    return True, ""
 
 
 def validate_version(conn: sqlite3.Connection, version: str) -> tuple[bool, str]:
@@ -328,11 +463,13 @@ def run_round(base_url: str, db_path: str) -> dict:
     init_db(db_path)
     conn = connect(db_path)
     client = SiteClient(base_url)
-    summary = {"versions_seen": [], "activated": None, "error": None}
+    summary = {"versions_seen": [], "activated": None, "error": None,
+               "pages_fetched": 0, "manifests_fetched": 0, "changed": False}
     try:
-        seen = {}
+        seen, changed = {}, {}
         for entry in ENTRIES:
-            seen[entry] = walk_entry(client, conn, entry)
+            seen[entry], changed[entry] = sync_entry(client, conn, entry, summary)
+        summary["changed"] = any(changed.values())
         if seen["registry"] != seen["joins"]:
             # 两入口切版时间不同：不标记失败、不激活，下一轮再看；查询保持旧版
             summary["error"] = (f"两个入口分属不同发布版：registry={seen['registry']}, "
@@ -340,6 +477,14 @@ def run_round(base_url: str, db_path: str) -> dict:
             return summary
         version = seen["registry"]
         summary["versions_seen"] = [version]
+        active = get_active_version(conn)
+        if version == active and not summary["changed"]:
+            # 资料与当前发布版一致，无需重复发布
+            return summary
+        ok, why = confirm_snapshot(client, conn, version, summary)
+        if not ok:
+            summary["error"] = why
+            return summary
         activate_version(conn, version)
         summary["activated"] = version
         return summary
@@ -364,6 +509,15 @@ def print_status(db_path: str) -> None:
         for p in conn.execute("SELECT version, entry, COUNT(*) n, MIN(total_pages) total "
                               "FROM pages GROUP BY version, entry ORDER BY version, entry"):
             print(f"  {p['version']:<8} {p['entry']:<9} {p['n']}/{p['total']} 页")
+        print("\n异常页（站点核验发现的坏页位置）:")
+        issues = conn.execute(
+            "SELECT version, entry, page_index, kind, detail FROM page_issues "
+            "ORDER BY id DESC LIMIT 10").fetchall()
+        if not issues:
+            print("  （无）")
+        for i in issues:
+            print(f"  {i['version']:<8} {i['entry']} 第 {i['page_index']} 页 "
+                  f"[{i['kind']}] {i['detail'] or ''}")
         print("\n失败记录（操作员可见的失败原因）:")
         fails = conn.execute("SELECT version, stage, reason, detail, created_at "
                              "FROM version_failures ORDER BY id DESC LIMIT 10").fetchall()

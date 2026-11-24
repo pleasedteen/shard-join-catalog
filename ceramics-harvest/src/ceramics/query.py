@@ -135,7 +135,12 @@ def list_groups(conn: sqlite3.Connection) -> dict:
 
 def status(conn: sqlite3.Connection) -> dict:
     version = get_active_version(conn)
-    out = {"active_version": version, "revisions": [], "history": []}
+    out = {"active_version": version, "revisions": [], "history": [],
+           "page_issues": []}
+    # 坏页位置：按发布版/入口/页序号标明，即使该版未激活也可见
+    out["page_issues"] = [dict(r) for r in conn.execute(
+        "SELECT version, entry, page_index, kind, detail, detected_at "
+        "FROM page_issues ORDER BY id")]
     if version:
         out["revisions"] = [dict(r) for r in conn.execute(
             "SELECT edge_key, reason, revoked_at FROM revocations WHERE version=? ORDER BY id",
