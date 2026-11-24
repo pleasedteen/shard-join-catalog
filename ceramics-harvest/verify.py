@@ -4,6 +4,15 @@
 运行：./run.sh verify   （或 python3 verify.py）
 80 秒内输出逐项可读结果，全部通过退出码为 0，任一失败退出码为 1。
 仅使用 Python 标准库，所有数据来自项目自带 fixtures。
+
+覆盖范围：
+- 会话/签名/按序令牌、暂停恢复、会话过期重登（协议层不变）；
+- 采集与发布拆成两个独立入口：采集只登记 ready_rounds 收齐清单，
+  发布只接手清单做整版校验与原子切换；
+- 断源发布（发布端不连站）、采集端/发布端分别中断后独立重启恢复；
+- 同一版只成功切换一次（并发/重启发布进程 + activation_log 保证）；
+- 整版校验期间采集端写入后续版、查询继续读旧版；
+- 撤销/恢复、错时切版、损坏页拦截、断点续采、HTTP 查询服务。
 """
 from __future__ import annotations
 
@@ -25,6 +34,8 @@ sys.path.insert(0, str(ROOT / "data"))
 
 from ceramics.db import connect, get_active_version, init_db  # noqa: E402
 from ceramics.protocol import issue_token, sign  # noqa: E402
+from ceramics import collector as col_mod  # noqa: E402
+from ceramics import publisher as pub_mod  # noqa: E402
 from ceramics import query as query_mod  # noqa: E402
 
 PASS, FAIL = "通过", "失败"
@@ -66,6 +77,15 @@ def wait_site(base: str, timeout: float = 10) -> None:
     raise RuntimeError("模拟站启动超时")
 
 
+def start_site(port: int):
+    env = dict(os.environ, PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "ceramics.site", "--port", str(port)],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    wait_site(f"http://127.0.0.1:{port}")
+    return proc
+
+
 def control(base: str, cmd: dict) -> dict:
     code, data = http("POST", base + "/control",
                       json.dumps(cmd).encode(),
@@ -99,13 +119,86 @@ def authed_get(base: str, sess: dict, path: str, token: str | None = None) -> tu
     })
 
 
-def run_collector(db: str, base: str) -> tuple[int, str]:
+def run_collector(db: str, base: str, rounds: int = 1) -> tuple[int, str]:
     env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
     proc = subprocess.run(
         [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
-         "--base-url", base, "--rounds", "1"],
+         "--base-url", base, "--rounds", str(rounds)],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     return proc.returncode, proc.stdout + proc.stderr
+
+
+def start_collector(db: str, base: str, rounds: int = 0):
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    return subprocess.Popen(
+        [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
+         "--base-url", base, "--rounds", str(rounds), "--retry-interval", "1"],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def run_publisher(db: str, *extra: str) -> tuple[int, str]:
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    proc = subprocess.run(
+        [sys.executable, "-m", "ceramics.publisher", "once", "--db", db, *extra],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def start_publisher(db: str, interval: float = 1.0, extra_env: dict | None = None):
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.Popen(
+        [sys.executable, "-m", "ceramics.publisher", "run", "--db", db,
+         "--interval", str(interval)],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def wait_ready(db: str, version: str, timeout: float = 20) -> int | None:
+    """等待采集端把指定版本的收齐清单写入 ready_rounds，返回清单 id。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        conn = connect(db)
+        try:
+            row = conn.execute(
+                "SELECT id FROM ready_rounds WHERE version=? ORDER BY id DESC LIMIT 1",
+                (version,)).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        finally:
+            conn.close()
+        if row:
+            return row["id"]
+        time.sleep(0.1)
+    return None
+
+
+def wait_active(db: str, version: str, timeout: float = 20) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        conn = connect(db)
+        try:
+            if get_active_version(conn) == version:
+                return True
+        finally:
+            conn.close()
+        time.sleep(0.1)
+    return False
+
+
+def activation_count(db: str, version: str) -> int:
+    conn = connect(db)
+    try:
+        return conn.execute("SELECT COUNT(*) c FROM activation_log WHERE version=?",
+                            (version,)).fetchone()["c"]
+    finally:
+        conn.close()
+
+
+def collect_then_publish(db: str, base: str, version: str) -> tuple[str, str]:
+    rc, cout = run_collector(db, base)
+    prc, pout = run_publisher(db)
+    return cout + pout, f"rc={rc}/{prc}"
 
 
 def main() -> int:
@@ -113,10 +206,8 @@ def main() -> int:
     db = str(tmp / "ceramics.db")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
-    env = dict(os.environ, PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}")
-    server = subprocess.Popen(
-        [sys.executable, "-m", "ceramics.site", "--port", str(port)],
-        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    env2 = dict(os.environ, PYTHONPATH=f"{ROOT / 'src'}:{ROOT / 'data'}")
+    server = start_site(port)
     try:
         wait_site(base)
         init_db(db)
@@ -154,12 +245,27 @@ def main() -> int:
         check("恢复后同一令牌链继续可用", code == 200 and time.time() - t0 < 10,
               f"耗时 {time.time() - t0:.1f}s")
 
-        # 3. 首轮采集并激活 v1
-        print("\n== 3. 首轮采集、校验与版本激活 ==")
-        rc, out = run_collector(db, base)
+        # 3. 采集与发布分离：采集只登记收齐清单，独立发布进程切换 v1
+        print("\n== 3. 采集登记清单、发布独立激活 v1 ==")
+        rc, cout = run_collector(db, base)
         conn = connect(db)
-        active = get_active_version(conn)
-        check("采集成功并激活 v1", rc == 0 and active == "v1", out.strip().splitlines()[-1])
+        rid = conn.execute("SELECT id, switch_status FROM ready_rounds WHERE version='v1'"
+                           ).fetchone()
+        check("采集端收齐 v1 并登记 pending 收齐清单（不直接激活）",
+              rc == 0 and rid is not None and rid["switch_status"] == "pending"
+              and get_active_version(conn) is None,
+              f"清单 #{rid['id'] if rid else '无'} 状态 {rid['switch_status'] if rid else ''}")
+        conn.close()
+        prc, pout = run_publisher(db)
+        conn = connect(db)
+        check("独立发布进程把 v1 原子切换为 active",
+              prc == 0 and get_active_version(conn) == "v1",
+              pout.strip().splitlines()[0] if pout.strip() else "")
+        check("清单状态同步为 switched 且激活日志恰好一条",
+              conn.execute("SELECT switch_status FROM ready_rounds WHERE version='v1'"
+                           ).fetchone()["switch_status"] == "switched"
+              and activation_count(db, "v1") == 1,
+              f"activation_log v1 共 {activation_count(db, 'v1')} 条")
         result = query_mod.find_sherd(conn, "C-001")
         check("查询返回陶片、连通组与发布版",
               result["version"] == "v1" and result["group_size"] == 3
@@ -186,22 +292,28 @@ def main() -> int:
         query_mod.restore_join(conn, "C-005", "C-006")
         back = query_mod.find_sherd(conn, "C-004")
         check("恢复撤销后回到原组", back["group_size"] == 3,
-              str([m["catalog_no"] for m in back["group"]]))
+              str([m['catalog_no'] for m in back['group']]))
         conn.close()
 
-        # 5. 入口错时切版：两入口不同版本期间不切换，同版后原子切换
+        # 5. 错时切版：两入口不同版期间只采集不发布，同版清单发布后原子切换
         print("\n== 5. 两个入口错时切换发布版 ==")
         control(base, {"entry_versions": {"registry": "v2"}})  # 只切登记
-        rc, out = run_collector(db, base)
+        rc, cout = run_collector(db, base)
         conn = connect(db)
-        check("入口版本不一致时查询仍为 v1", get_active_version(conn) == "v1",
-              out.strip().splitlines()[-1])
+        check("入口版本不一致时不登记清单，查询仍为 v1",
+              get_active_version(conn) == "v1"
+              and conn.execute("SELECT 1 FROM ready_rounds WHERE version='v2'").fetchone() is None,
+              cout.strip().splitlines()[-1])
         conn.close()
         control(base, {"entry_versions": {"joins": "v2"}})  # 拼接也切到 v2
-        rc, out = run_collector(db, base)
+        rc, cout = run_collector(db, base)
+        check("同版收齐后登记 v2 清单", wait_ready(db, "v2") is not None,
+              cout.strip().splitlines()[-1])
+        prc, pout = run_publisher(db)
         conn = connect(db)
-        check("两入口同属 v2 后原子激活", rc == 0 and get_active_version(conn) == "v2",
-              out.strip().splitlines()[-1])
+        check("发布端接手清单后原子激活 v2",
+              prc == 0 and get_active_version(conn) == "v2",
+              pout.strip().splitlines()[0] if pout.strip() else "")
         result = query_mod.find_sherd(conn, "C-010")
         check("v2 新陶片可查且并入 C-001 组",
               result["version"] == "v2" and result["group_size"] == 4,
@@ -211,15 +323,11 @@ def main() -> int:
               == "jsonl")
         conn.close()
 
-        # 6. 采集期间查询不中断：站点暂停制造确定的"采集中"窗口，前台持续命中 v2
-        print("\n== 6. 采集期间查询继续返回上一个完整版本 ==")
+        # 6. 采集期间查询不中断：采集与发布是两个进程，采集窗口内前台始终命中旧版
+        print("\n== 6. 采集/发布期间查询继续返回上一个完整版本 ==")
         control(base, {"entry_versions": {"registry": "v3", "joins": "v3"},
                        "pause_seconds": 4})
-        env2 = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
-        bg = subprocess.Popen(
-            [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
-             "--base-url", base, "--rounds", "1"],
-            cwd=ROOT, env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        bg = start_collector(db, base, rounds=1)
         seen_versions = set()
         deadline = time.time() + 3
         while time.time() < deadline:  # 采集被暂停挡在门外，期间反复查询
@@ -228,55 +336,71 @@ def main() -> int:
             conn.close()
             time.sleep(0.1)
         bg.wait(timeout=40)
-        bg_out = bg.stdout.read()
-        conn = connect(db)
-        check("采集窗口内查询始终是旧版 v2，采集完成后切到 v3",
-              seen_versions == {"v2"} and get_active_version(conn) == "v3",
+        check("采集窗口内查询始终是旧版 v2，清单未提前切换",
+              seen_versions == {"v2"} and get_active_version(connect(db)) == "v2",
               f"采集中可见版本: {sorted(seen_versions)}")
+        pub = start_publisher(db)
+        try:
+            check("发布端独立完成 v3 切换", wait_active(db, "v3"),
+                  "采集进程已退出，发布进程单独读取清单完成切换")
+        finally:
+            pub.terminate()
+            pub.wait(timeout=5)
+        conn = connect(db)
         check("v3 第三种排版(record)解析正确",
               conn.execute("SELECT layout FROM pages WHERE version='v3' LIMIT 1").fetchone()[0]
               == "record")
         conn.close()
 
-        # 7. 损坏页：失败原因对操作员可见，查询保持旧版
-        print("\n== 7. 新版资料损坏：记录原因并继续使用旧版 ==")
+        # 7. 损坏/引用不完整：发布端整版校验拦截，查询保持旧版
+        print("\n== 7. 新版资料损坏：发布端拦截并继续使用旧版 ==")
         control(base, {"entry_versions": {"registry": "v4-bad", "joins": "v4-bad"}})
-        rc, out = run_collector(db, base)
+        rc, cout = run_collector(db, base)
+        check("v4-bad 仍由采集端登记收齐清单（采集不做整版校验）",
+              wait_ready(db, "v4-bad") is not None, cout.strip().splitlines()[-1])
+        prc, pout = run_publisher(db)
         conn = connect(db)
         fail = conn.execute(
             "SELECT reason, detail FROM version_failures WHERE version='v4-bad' "
             "ORDER BY id DESC LIMIT 1").fetchone()
-        check("v4-bad 引用不完整被拦截，查询仍为 v3",
-              get_active_version(conn) == "v3" and fail is not None
-              and "X-999" in (fail["detail"] or ""),
+        check("发布端拦截引用不完整的 v4-bad，查询仍为 v3，清单标记 failed",
+              prc == 0 and get_active_version(conn) == "v3" and fail is not None
+              and "X-999" in (fail["detail"] or "")
+              and conn.execute(
+                  "SELECT switch_status FROM ready_rounds WHERE version='v4-bad' "
+                  "ORDER BY id DESC LIMIT 1").fetchone()["switch_status"] == "failed",
               f"{fail['reason'] if fail else '无失败记录'}: "
               f"{fail['detail'] if fail else ''}")
         conn.close()
         # 现场制造一个损坏页（站点返回截断内容、校验和不符）
         control(base, {"entry_versions": {"registry": "v3", "joins": "v3"},
                        "broken_pages": {"registry@v3": [0]}})
-        rc, out = run_collector(db, base)
-        conn = connect(db)
+        db_b = str(tmp / "broken.db")
+        rc, cout = run_collector(db_b, base)
+        conn = connect(db_b)
         corrupt = conn.execute(
             "SELECT reason FROM version_failures WHERE detail LIKE '%registry 第 0 页%' "
             "ORDER BY id DESC LIMIT 1").fetchone()
-        check("损坏页被校验和/损坏标记识别", corrupt is not None,
-              corrupt["reason"] if corrupt else out.strip().splitlines()[-1])
-        check("损坏不影响当前 active(v3) 查询", get_active_version(conn) == "v3")
+        check("损坏页被采集端校验和/损坏标记识别", corrupt is not None,
+              corrupt["reason"] if corrupt else cout.strip().splitlines()[-1])
+        conn.close()
+        prc, pout = run_publisher(db_b)
+        conn = connect(db_b)
+        check("损坏版没有清单可发布，查询始终无 active（旧版语义不受影响）",
+              get_active_version(conn) is None
+              and conn.execute("SELECT COUNT(*) c FROM ready_rounds").fetchone()["c"] == 0,
+              pout.strip().splitlines()[-1] if pout.strip() else "")
         conn.close()
         control(base, {"clear_broken": True})
 
-        # 8. 进程重启断点续采：先确认部分页面落盘，再杀进程，重启后复用已确认页
-        print("\n== 8. 进程重启后复用已确认页面继续采集 ==")
+        # 8. 采集进程重启断点续采（发布端独立，不参与续采）
+        print("\n== 8. 采集进程中断重启，复用已确认页面继续采集 ==")
         control(base, {"entry_versions": {"registry": "v2", "joins": "v2"}})
         db2 = str(tmp / "resume.db")
         # 第一步：暂停站点，启动采集——它会在暂停结束后先落盘 registry 全部页，
         # 在抓 joins 期间被强杀，制造"部分页面已确认保存"的现场
         control(base, {"pause_seconds": 3})
-        killed = subprocess.Popen(
-            [sys.executable, "-m", "ceramics.collector", "run", "--db", db2,
-             "--base-url", base, "--rounds", "1"],
-            cwd=ROOT, env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        killed = start_collector(db2, base, rounds=1)
         conn2 = connect(db2)
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -294,21 +418,22 @@ def main() -> int:
         killed.kill()
         killed.wait()
         check("被杀前已有确认页面落盘", saved_before > 0, f"已保存 {saved_before} 页")
-        # 第二步：新进程重启采集，重走入口时跳过已确认页面并补齐剩余页面
+        # 第二步：新采集进程重启，重走入口时跳过已确认页面并补齐，再由发布端切换
         rc, out2 = run_collector(db2, base)
+        check("重启后采集完成并登记 v2 清单",
+              wait_ready(db2, "v2") is not None and "断点续采" in out2,
+              "重走入口时校验和一致即跳过，清单落盘后采集进程可再次退出")
+        prc, pout = run_publisher(db2)
         conn2 = connect(db2)
         saved_after = conn2.execute("SELECT COUNT(*) c FROM pages").fetchone()["c"]
-        check("重启后采集完成并激活 v2",
-              rc == 0 and get_active_version(conn2) == "v2",
+        check("发布端独立把 v2 激活",
+              prc == 0 and get_active_version(conn2) == "v2",
               f"页面 {saved_before} -> {saved_after}")
-        check("日志显示断点跳过已保存页面", "断点续采" in out2,
-              "重走入口时校验和一致即跳过")
         conn2.close()
 
-        # 9. 会话频繁过期：确定性地每隔一次请求让会话失效，验证重登+续采仍能完成
+        # 9. 会话频繁过期：采集端重登+续采仍能完成（发布逻辑不受影响）
         print("\n== 9. 会话频繁过期，自动重登并按已保存页续采 ==")
         control(base, {"entry_versions": {"registry": "v1", "joins": "v1"}})
-        from ceramics import collector as col_mod
         db4 = str(tmp / "relogin.db")
         calls = {"n": 0}
         orig_fetch = col_mod.SiteClient.fetch_page
@@ -321,12 +446,14 @@ def main() -> int:
 
         col_mod.SiteClient.fetch_page = patched_fetch
         try:
-            res = col_mod.run_round(base, db4)
+            res = col_mod.collect_round(base, db4)
         finally:
             col_mod.SiteClient.fetch_page = orig_fetch
+        prc, pout = run_publisher(db4)
         conn4 = connect(db4)
-        check("频繁会话过期下重登+续采仍完成激活",
-              res.get("activated") == "v1" and get_active_version(conn4) == "v1",
+        check("频繁会话过期下重登+续采仍收齐清单并由发布端激活 v1",
+              res.get("ready") == "v1" and prc == 0
+              and get_active_version(conn4) == "v1",
               f"期间翻页调用 {calls['n']} 次，每次失效都未重复抓取已确认页")
         conn4.close()
 
@@ -357,6 +484,194 @@ def main() -> int:
         finally:
             qsrv.terminate()
             qsrv.wait(timeout=5)
+
+        # 11. 拆分架构的三项关键保证：断源发布、两端中断恢复、同一版只切换一次
+        print("\n== 11. 断源发布、两端独立重启恢复、同一版只成功切换一次 ==")
+        dbd = str(tmp / "decouple.db")
+        dport = free_port()
+        dbase = f"http://127.0.0.1:{dport}"
+        dsite = start_site(dport)
+        try:
+            # 11a. 采集端连站收齐 v1 清单
+            rc, cout = run_collector(dbd, dbase)
+            check("独立库采集端登记 v1 收齐清单", rc == 0 and wait_ready(dbd, "v1") is not None,
+                  cout.strip().splitlines()[-1])
+        finally:
+            # 断源：关掉模拟站，之后发布端全程无站点可连
+            dsite.terminate()
+            dsite.wait(timeout=5)
+        prc, pout = run_publisher(dbd)
+        check("断源后发布端仅凭本地清单完成 v1 切换（发布端不访问站点）",
+              prc == 0 and get_active_version(connect(dbd)) == "v1",
+              pout.strip().splitlines()[0] if pout.strip() else "")
+        # 11b. 采集端在断源期间不退出、自动重试；站点恢复后独立续采收齐 v2
+        control(base, {"entry_versions": {"registry": "v2", "joins": "v2"}})
+        bg_col = start_collector(dbd, dbase, rounds=0)  # 站点已关，进入重试循环
+        time.sleep(2.5)
+        poll = bg_col.poll()
+        check("断源期间采集进程存活并持续重试（不退出、不需重跑连站）",
+              poll is None, f"进程状态: {'运行中' if poll is None else f'已退出({poll})'}")
+        dsite2 = start_site(dport)  # 同端口恢复站点（站点状态重置，需重新切到 v2）
+        try:
+            control(dbase, {"entry_versions": {"registry": "v2", "joins": "v2"}})
+            check("站点恢复后采集端自动续采并登记 v2 清单",
+                  wait_ready(dbd, "v2", timeout=25) is not None, "无需人工重启采集进程")
+        finally:
+            bg_col.kill()
+            bg_col.wait(timeout=5)
+            dsite2.terminate()
+            dsite2.wait(timeout=5)
+
+        # 11c. 发布端中断重启：先造 v1/v2 两条清单，杀掉持续发布进程后重启补齐
+        dbp = str(tmp / "pubresume.db")
+        pport = free_port()
+        pbase = f"http://127.0.0.1:{pport}"
+        psite = start_site(pport)
+        try:
+            run_collector(dbp, pbase)  # v1 清单
+            control(pbase, {"entry_versions": {"registry": "v2", "joins": "v2"}})
+            run_collector(dbp, pbase)  # v2 清单
+            conn = connect(dbp)
+            n_pending = conn.execute(
+                "SELECT COUNT(*) c FROM ready_rounds WHERE switch_status='pending'").fetchone()["c"]
+            conn.close()
+            check("发布前两条收齐清单均为 pending", n_pending == 2, f"pending={n_pending}")
+            # 每条清单处理完暂停 3s，确定性制造"v1 已切换、v2 仍 pending"的中断窗口
+            pub = start_publisher(dbp, interval=2.0,
+                                  extra_env={"CERAMICS_PUBLISH_PAUSE": "3"})
+            deadline = time.time() + 15
+            killed_in_window = False
+            while time.time() < deadline:
+                conn = connect(dbp)
+                try:
+                    v1_active = get_active_version(conn) == "v1"
+                    v2_pending = conn.execute(
+                        "SELECT 1 FROM ready_rounds WHERE version='v2' "
+                        "AND switch_status='pending'").fetchone() is not None
+                finally:
+                    conn.close()
+                if v1_active and v2_pending:
+                    pub.kill()
+                    pub.wait(timeout=5)
+                    killed_in_window = True
+                    break
+                time.sleep(0.05)
+            if not killed_in_window:
+                pub.kill()
+                pub.wait(timeout=5)
+            mid = get_active_version(connect(dbp))
+            conn = connect(dbp)
+            v2_still_pending = conn.execute(
+                "SELECT 1 FROM ready_rounds WHERE version='v2' "
+                "AND switch_status='pending'").fetchone() is not None
+            conn.close()
+            check("强杀发布进程时 v2 清单仍为 pending（中断现场确定）",
+                  killed_in_window and mid == "v1" and v2_still_pending,
+                  f"中断时 active={mid}")
+            rc2, pout2 = run_publisher(dbp)  # 新发布进程重启，接手剩余清单
+            conn = connect(dbp)
+            check("发布进程中断重启后继续处理未切换清单（v1 -> v2）",
+                  mid == "v1" and rc2 == 0 and get_active_version(conn) == "v2",
+                  f"中断时 active={mid}，重启后 {get_active_version(conn)}")
+            check("v1 与 v2 各自只成功切换一次",
+                  activation_count(dbp, "v1") == 1 and activation_count(dbp, "v2") == 1,
+                  f"v1={activation_count(dbp, 'v1')} 条, v2={activation_count(dbp, 'v2')} 条")
+            conn.close()
+        finally:
+            psite.terminate()
+            psite.wait(timeout=5)
+
+        # 11d. 并发两个发布进程：同一版只有一个成功者，激活日志不重复
+        dbc = str(tmp / "concurrent.db")
+        cport = free_port()
+        cbase = f"http://127.0.0.1:{cport}"
+        csite = start_site(cport)
+        try:
+            run_collector(dbc, cbase)
+            check("并发发布前 v1 清单就绪", wait_ready(dbc, "v1") is not None)
+        finally:
+            csite.terminate()
+            csite.wait(timeout=5)
+        p1 = start_publisher(dbc, interval=0.2)
+        p2 = start_publisher(dbc, interval=0.2)
+        try:
+            check("两个并发发布进程收敛到同一 active 且 v1 只切换一次",
+                  wait_active(dbc, "v1") and activation_count(dbc, "v1") == 1,
+                  f"activation_log v1={activation_count(dbc, 'v1')} 条")
+        finally:
+            p1.terminate(); p2.terminate()
+            p1.wait(timeout=5); p2.wait(timeout=5)
+        # 人为再登记一条 v1 收齐清单（模拟采集端重跑），发布端必须只跳过不重切
+        conn = connect(dbc)
+        conn.execute("INSERT INTO ready_rounds(version, registry_pages, joins_pages, "
+                     "switch_status, created_at) VALUES ('v1', 2, 2, 'pending', ?)",
+                     (time.time(),))
+        conn.commit()
+        conn.close()
+        rc3, pout3 = run_publisher(dbc)
+        check("发布端重复运行对已切换版本只跳过不重切",
+              activation_count(dbc, "v1") == 1 and "跳过" in pout3,
+              pout3.strip().splitlines()[0] if pout3.strip() else "")
+
+        # 12. 整版校验/切换期间，采集端可写入后续版页面，查询继续读旧版
+        print("\n== 12. 发布整版校验期间采集写入后续版、查询读旧版 ==")
+        dbo = str(tmp / "overlap.db")
+        oport = free_port()
+        obase = f"http://127.0.0.1:{oport}"
+        osite = start_site(oport)
+        try:
+            run_collector(dbo, obase)  # v1 清单
+            run_publisher(dbo)          # 先发布 v1
+            control(obase, {"entry_versions": {"registry": "v2", "joins": "v2"}})
+            run_collector(dbo, obase)  # v2 清单先就绪（发布端稍后才接手）
+            check("前置：overlap 库 active 为 v1，v2 清单待发布",
+                  get_active_version(connect(dbo)) == "v1" and wait_ready(dbo, "v2") is not None)
+            # 站点切到 v3：发布端校验 v2 的窗口里，采集端并发把*后续版* v3 页面落盘
+            control(obase, {"entry_versions": {"registry": "v3", "joins": "v3"}})
+            orig_validate = pub_mod.validate_version
+            state = {"during": []}
+
+            def slow_validate(conn, version):
+                end = time.time() + 1.5
+                while time.time() < end:
+                    c = connect(dbo)
+                    try:
+                        state["during"].append((get_active_version(c),
+                                                c.execute("SELECT COUNT(*) c FROM pages "
+                                                          "WHERE version='v3'").fetchone()["c"]))
+                    finally:
+                        c.close()
+                    time.sleep(0.15)
+                return orig_validate(conn, version)
+
+            pub_mod.validate_version = slow_validate
+            collector_proc = start_collector(dbo, obase, rounds=1)
+            try:
+                # 发布端在本进程内执行，使校验窗口补丁生效；采集端仍是独立子进程
+                pub_result = pub_mod.publish_once(dbo)
+            finally:
+                pub_mod.validate_version = orig_validate
+            collector_proc.wait(timeout=30)
+            conn = connect(dbo)
+            v3_pages = conn.execute("SELECT COUNT(*) c FROM pages WHERE version='v3'").fetchone()["c"]
+            check("校验窗口内查询始终读旧版 v1，且采集端持续写入后续版 v3 页面",
+                  bool(state["during"])
+                  and all(active == "v1" for active, _ in state["during"])
+                  and any(n > 0 for _, n in state["during"]),
+                  f"窗口内 active 集合={sorted({a for a, _ in state['during']})}, "
+                  f"窗口内 v3 页数={[n for _, n in state['during']]}")
+            check("窗口结束后发布提交 v2，v3 页面完整保留且可继续发布",
+                  bool(pub_result["switched"]) and get_active_version(conn) == "v2"
+                  and v3_pages > 0,
+                  f"v3 已写入 {v3_pages} 页")
+            prc2, _ = run_publisher(dbo)  # 采集端已把 v3 清单登记，发布端可继续接手
+            check("后续版 v3 在不重采的情况下直接发布成功",
+                  prc2 == 0 and get_active_version(conn) == "v3",
+                  f"active={get_active_version(conn)}")
+            conn.close()
+        finally:
+            osite.terminate()
+            osite.wait(timeout=5)
 
     finally:
         server.terminate()

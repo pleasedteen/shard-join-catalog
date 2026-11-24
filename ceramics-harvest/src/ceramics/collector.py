@@ -1,11 +1,13 @@
-"""采集服务：按会话协议抓取两个入口，校验后按发布版原子激活。
+"""采集服务：按会话协议抓取两个入口，收齐同版清单后交给发布端。
 
-关键保证：
+本进程只负责采集与落盘，不再直接激活发布版：
 - 503 暂停：按 Retry-After 等待后用*同一令牌*重试（暂停不消耗游标）。
 - 401 过期 / 令牌跨会话：重新登录，并从入口第一页重走；已确认保存的页面
   校验和一致即跳过，实现进程重启后的断点续采。
-- 登记与拼接必须同属一个发布版、页数齐全、每页校验通过、拼接引用完整，
-  才在一个事务里切换 active；采集与校验期间查询继续命中旧 active 版本。
+- 网络中断时按间隔重试整轮，采集进程可独立重启，无需发布端或站点配合。
+- 两个入口在*同一轮*确认同属一个发布版且页数齐全后，向 ready_rounds 写入
+  一条收齐清单（manifest）。发布端（ceramics.publisher）只接手该清单做整版
+  校验与原子切换；采集与校验互不阻塞，查询继续命中旧 active 版本。
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ import urllib.request
 
 from ceramics.db import connect, get_active_version, init_db
 from ceramics.parsing import parse_page
-from ceramics.protocol import edge_key, page_checksum
+from ceramics.protocol import page_checksum
 
 ENTRIES = ("registry", "joins")
 MAX_SESSION_RESTARTS = 100
@@ -285,69 +287,69 @@ def validate_version(conn: sqlite3.Connection, version: str) -> tuple[bool, str]
     return True, ""
 
 
-def activate_version(conn: sqlite3.Connection, version: str) -> None:
-    ok, reason = validate_version(conn, version)
-    if not ok:
-        _record_failure(conn, version, "activate", "validation_failed", reason)
-        raise SiteError("validation_failed", reason)
-
-    registry_rows, join_rows = [], []
-    for p in conn.execute("SELECT * FROM pages WHERE version=? AND entry='registry' "
-                          "ORDER BY page_index", (version,)):
-        registry_rows.extend(parse_page("registry", p["layout"], p["body"]))
-    for p in conn.execute("SELECT * FROM pages WHERE version=? AND entry='joins' "
-                          "ORDER BY page_index", (version,)):
-        join_rows.extend(parse_page("joins", p["layout"], p["body"]))
-
-    published = conn.execute("SELECT published_at FROM versions WHERE version=?",
-                             (version,)).fetchone()
-    # 单事务切换：任何一步失败，旧 active 保持不变
-    with conn:
-        conn.execute("DELETE FROM sherds WHERE version=?", (version,))
-        conn.execute("DELETE FROM joins WHERE version=?", (version,))
-        conn.executemany(
-            "INSERT INTO sherds(version, catalog_no, museum, material, weight_g) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [(version, r["catalog_no"], r["museum"], r["material"], r["weight_g"])
-             for r in registry_rows])
-        conn.executemany(
-            "INSERT INTO joins(version, edge_key, a, b, bond, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [(version, edge_key(r["a"], r["b"]), r["a"], r["b"], r["bond"], r["confidence"])
-             for r in join_rows])
-        conn.execute("UPDATE versions SET status='complete', updated_at=? WHERE status='active'",
-                     (time.time(),))
-        conn.execute("UPDATE versions SET status='active', published_at=?, updated_at=? "
-                     "WHERE version=?",
-                     (published["published_at"] if published else None, time.time(), version))
-        conn.execute("INSERT INTO activation_log(version, activated_at) VALUES (?, ?)",
-                     (version, time.time()))
+def latest_ready_round(conn: sqlite3.Connection, version: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM ready_rounds WHERE version=? ORDER BY id DESC LIMIT 1",
+        (version,)).fetchone()
 
 
-def run_round(base_url: str, db_path: str) -> dict:
+def mark_ready_round(conn: sqlite3.Connection, version: str) -> bool:
+    """两个入口在同一轮确认同版且页数齐全时，登记一条收齐清单。
+
+    同一版本若已有 pending/switched 清单则不重复登记；发布端重启后据此继续。
+    返回本次是否新写入清单。
+    """
+    counts = {}
+    for entry in ENTRIES:
+        row = conn.execute(
+            "SELECT COUNT(*) n, MIN(total_pages) total FROM pages "
+            "WHERE version=? AND entry=?", (version, entry)).fetchone()
+        if not row["total"] or row["n"] != row["total"]:
+            return False
+        counts[entry] = row["n"]
+    existing = latest_ready_round(conn, version)
+    if existing is not None and existing["switch_status"] in ("pending", "switched"):
+        return False
+    conn.execute(
+        "INSERT INTO ready_rounds(version, registry_pages, joins_pages, "
+        "switch_status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+        (version, counts["registry"], counts["joins"], time.time()))
+    conn.commit()
+    return True
+
+
+def collect_round(base_url: str, db_path: str) -> dict:
+    """执行一轮采集：抓取两个入口，收齐同版后登记 ready_rounds 清单。
+
+    与发布端完全解耦：本函数不做整版校验、不切换 active，只负责把确认收齐
+    的页面与清单落盘。网络类错误向上抛由外层重试，其它 SiteError 记录原因。
+    """
     init_db(db_path)
     conn = connect(db_path)
     client = SiteClient(base_url)
-    summary = {"versions_seen": [], "activated": None, "error": None}
+    summary = {"versions_seen": [], "ready": None, "error": None}
     try:
         seen = {}
         for entry in ENTRIES:
             seen[entry] = walk_entry(client, conn, entry)
         if seen["registry"] != seen["joins"]:
-            # 两入口切版时间不同：不标记失败、不激活，下一轮再看；查询保持旧版
+            # 两入口切版时间不同：不标记失败、不登记清单，下一轮再看；查询保持旧版
             summary["error"] = (f"两个入口分属不同发布版：registry={seen['registry']}, "
-                                f"joins={seen['joins']}，等待同版后再激活")
+                                f"joins={seen['joins']}，等待同版后再登记收齐清单")
             return summary
         version = seen["registry"]
         summary["versions_seen"] = [version]
-        activate_version(conn, version)
-        summary["activated"] = version
-        return summary
-    except SiteError as exc:
-        summary["error"] = f"{exc.kind}: {exc}"
+        if mark_ready_round(conn, version):
+            summary["ready"] = version
+        else:
+            summary["ready"] = version  # 清单已存在（可能待发布或已切换），无需重复登记
         return summary
     finally:
         conn.close()
+
+
+# 兼容旧名称：测试与外部脚本若仍引用 run_round，等价于一轮纯采集
+run_round = collect_round
 
 
 def print_status(db_path: str) -> None:
@@ -371,6 +373,14 @@ def print_status(db_path: str) -> None:
             print("  （无）")
         for f in fails:
             print(f"  {f['version']:<8} [{f['stage']}] {f['reason']} — {f['detail']}")
+        print("\n收齐清单（等待/已完成发布切换）:")
+        rounds = conn.execute("SELECT id, version, registry_pages, joins_pages, "
+                              "switch_status, created_at FROM ready_rounds ORDER BY id").fetchall()
+        if not rounds:
+            print("  （无）")
+        for r in rounds:
+            print(f"  #{r['id']:<3} {r['version']:<8} 登记{r['registry_pages']}页/"
+                  f"拼接{r['joins_pages']}页  {r['switch_status']}")
         if active:
             rev = conn.execute("SELECT edge_key FROM revocations WHERE version=?",
                                (active,)).fetchall()
@@ -386,13 +396,15 @@ def main() -> None:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
-    ap = argparse.ArgumentParser(description="陶片清单采集服务")
+    ap = argparse.ArgumentParser(description="陶片清单采集服务（只采集与登记收齐清单，不发布）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     runp = sub.add_parser("run", help="执行采集轮次（默认一轮）")
     runp.add_argument("--base-url", default="http://127.0.0.1:8080")
     runp.add_argument("--db", default="./ceramics.db")
     runp.add_argument("--rounds", type=int, default=1, help="采集轮数，0 表示持续运行")
     runp.add_argument("--interval", type=float, default=3.0, help="持续运行时轮间秒数")
+    runp.add_argument("--retry-interval", type=float, default=3.0,
+                      help="断源（无法连接站点）时的重试秒数，进程不退出")
 
     stat = sub.add_parser("status", help="查看采集与版本状态")
     stat.add_argument("--db", default="./ceramics.db")
@@ -406,11 +418,25 @@ def main() -> None:
     while True:
         rounds_done += 1
         print(f"[采集] 第 {rounds_done} 轮开始 {time.strftime('%H:%M:%S')}")
-        result = run_round(args.base_url, args.db)
-        if result["activated"]:
-            print(f"[采集] 发布版 {result['activated']} 已激活，查询已切换")
+        try:
+            result = collect_round(args.base_url, args.db)
+        except SiteError as exc:
+            # 断源/其它站点级错误：记录本轮失败但不退出，按重试间隔再试，
+            # 已确认页面已落盘，下一轮自动断点续采。
+            if exc.kind == "network":
+                print(f"[采集] 无法连接站点（{exc}），{args.retry_interval}s 后重试，"
+                      "已确认页面不会丢失")
+            else:
+                print(f"[采集] 本轮采集失败：{exc.kind}: {exc}")
+            if args.rounds and rounds_done >= args.rounds:
+                break
+            time.sleep(exc.retry_after or args.retry_interval)
+            continue
+        if result["ready"]:
+            print(f"[采集] 发布版 {result['ready']} 两个入口已收齐，"
+                  "清单已登记，等待发布端切换")
         elif result["error"]:
-            print(f"[采集] 本轮未切换版本：{result['error']}")
+            print(f"[采集] 本轮未登记清单：{result['error']}")
             print("       查询继续使用上一个完整版本，详见 status 失败记录")
         else:
             print("[采集] 本轮无新版本变化")

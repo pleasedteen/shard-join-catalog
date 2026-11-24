@@ -71,6 +71,20 @@ CREATE TABLE IF NOT EXISTS activation_log(
     version TEXT NOT NULL,
     activated_at REAL NOT NULL
 );
+
+-- 采集端在同一轮确认两个入口同版、页数齐全后写入的"收齐清单"。
+-- 发布端只接手 switch_status='pending' 的清单，与采集过程解耦：
+-- 采集进程退出/重启不影响清单，发布进程重启后继续处理未切换的清单。
+CREATE TABLE IF NOT EXISTS ready_rounds(
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    version        TEXT NOT NULL,
+    registry_pages INTEGER NOT NULL,
+    joins_pages    INTEGER NOT NULL,
+    switch_status  TEXT NOT NULL DEFAULT 'pending'
+                   CHECK(switch_status IN ('pending','switched','failed')),
+    created_at     REAL NOT NULL,
+    switched_at    REAL
+);
 """
 
 
