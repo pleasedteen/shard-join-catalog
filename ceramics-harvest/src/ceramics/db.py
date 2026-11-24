@@ -1,4 +1,4 @@
-"""SQLite 持久层：采集页、发布版状态、登记/拼接数据、撤销记录。"""
+"""SQLite 持久层：采集页、分册清单、发布版状态、登记/拼接数据、撤销记录。"""
 from __future__ import annotations
 
 import sqlite3
@@ -15,18 +15,31 @@ CREATE TABLE IF NOT EXISTS versions(
     updated_at   REAL NOT NULL
 );
 
--- 已确认保存的原始页面；(version, entry, page_index) 唯一，
--- 进程重启后采集端据此跳过已确认页面继续采集。
+-- 已确认保存的原始页面；(version, entry, volume, page_index) 唯一。
+-- volume 为空串表示旧站两入口协议下的整入口页面；分册采集则为分册名。
+-- 进程重启后采集端据此按分册跳过已确认页面继续采集。
 CREATE TABLE IF NOT EXISTS pages(
     version    TEXT NOT NULL,
     entry      TEXT NOT NULL CHECK(entry IN ('registry','joins')),
+    volume     TEXT NOT NULL DEFAULT '',
     page_index INTEGER NOT NULL,
     total_pages INTEGER NOT NULL,
     layout     TEXT NOT NULL,
     checksum   TEXT NOT NULL,
     body       TEXT NOT NULL,
     saved_at   REAL NOT NULL,
-    PRIMARY KEY (version, entry, page_index)
+    PRIMARY KEY (version, entry, volume, page_index)
+);
+
+-- 某发布版的分册清单：先按站点清单登记*全部应采分册*（total_pages 暂空），
+-- 每采到该分册首页再补全页数。激活前据此核对"所有分册同版收齐"。
+CREATE TABLE IF NOT EXISTS volume_manifest(
+    version     TEXT NOT NULL,
+    entry       TEXT NOT NULL CHECK(entry IN ('registry','joins')),
+    volume      TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL DEFAULT 0,
+    total_pages INTEGER,
+    PRIMARY KEY (version, entry, volume)
 );
 
 CREATE TABLE IF NOT EXISTS version_failures(
@@ -83,10 +96,37 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_pages_volume(conn: sqlite3.Connection) -> None:
+    """把早期没有 volume 列的 pages 表重建为分册感知的表，旧数据归入 '' 分册。"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(pages)")]
+    if "volume" in cols:
+        return
+    conn.execute("ALTER TABLE pages RENAME TO pages_legacy")
+    conn.execute(
+        "CREATE TABLE pages("
+        " version TEXT NOT NULL,"
+        " entry TEXT NOT NULL CHECK(entry IN ('registry','joins')),"
+        " volume TEXT NOT NULL DEFAULT '',"
+        " page_index INTEGER NOT NULL,"
+        " total_pages INTEGER NOT NULL,"
+        " layout TEXT NOT NULL,"
+        " checksum TEXT NOT NULL,"
+        " body TEXT NOT NULL,"
+        " saved_at REAL NOT NULL,"
+        " PRIMARY KEY (version, entry, volume, page_index))")
+    conn.execute(
+        "INSERT INTO pages(version, entry, volume, page_index, total_pages,"
+        " layout, checksum, body, saved_at) "
+        "SELECT version, entry, '', page_index, total_pages, layout, checksum, body, saved_at "
+        "FROM pages_legacy")
+    conn.execute("DROP TABLE pages_legacy")
+
+
 def init_db(db_path: str | Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_pages_volume(conn)
         conn.commit()
     finally:
         conn.close()

@@ -75,18 +75,33 @@ def control(base: str, cmd: dict) -> dict:
     return data["state"]
 
 
+def site_state(base: str) -> dict:
+    """读取模拟站状态（含名额事件、抓页次数），用于可观测量断言。"""
+    code, data = http("POST", base + "/control", b"{}",
+                      {"X-Control-Key": "ceramics-local-control",
+                       "Content-Type": "application/json"})
+    assert code == 200, data
+    return data["state"]
+
+
 def login(base: str) -> dict:
-    # 站点可能正处于暂停期：按 503 等待恢复后再登录
+    # 站点可能正处于暂停期或名额已被测试会话占用：按 503/429 等待后再登录
     deadline = time.time() + 20
     while True:
         code, data = http("POST", base + "/session", b"key=ceramics-local-control",
                           {"Content-Type": "application/x-www-form-urlencoded"})
         if code == 200:
             return data
-        if code == 503 and time.time() < deadline:
+        if code in (503, 429) and time.time() < deadline:
             time.sleep(0.5)
             continue
         assert False, data
+
+
+def release(base: str, sess: dict) -> None:
+    http("POST", base + "/release",
+         f"key=ceramics-local-control&sid={sess['sid']}".encode(),
+         {"Content-Type": "application/x-www-form-urlencoded"})
 
 
 def authed_get(base: str, sess: dict, path: str, token: str | None = None) -> tuple[int, dict]:
@@ -140,6 +155,8 @@ def main() -> int:
         check("新会话不能使用旧令牌(403)", code == 403, data.get("error", ""))
         code, data = authed_get(base, s1, "/registry", token=issue_token(s2["sid"], 0))
         check("令牌与会话不匹配被拒(403)", code == 403, data.get("error", ""))
+        release(base, s1)
+        release(base, s2)
 
         # 2. 暂停受理：503 + Retry-After，恢复后同令牌继续
         print("\n== 2. 站点暂停受理与恢复 ==")
@@ -153,6 +170,7 @@ def main() -> int:
         code, page = authed_get(base, s3, "/joins")
         check("恢复后同一令牌链继续可用", code == 200 and time.time() - t0 < 10,
               f"耗时 {time.time() - t0:.1f}s")
+        release(base, s3)
 
         # 3. 首轮采集并激活 v1
         print("\n== 3. 首轮采集、校验与版本激活 ==")
@@ -252,16 +270,21 @@ def main() -> int:
               f"{fail['reason'] if fail else '无失败记录'}: "
               f"{fail['detail'] if fail else ''}")
         conn.close()
-        # 现场制造一个损坏页（站点返回截断内容、校验和不符）
+        # 现场制造一个损坏页（站点返回截断内容、校验和不符）；用新库真实抓取该页，
+        # 主库 v3 已确认页面不重下，因此主库不受影响。
         control(base, {"entry_versions": {"registry": "v3", "joins": "v3"},
                        "broken_pages": {"registry@v3": [0]}})
-        rc, out = run_collector(db, base)
-        conn = connect(db)
+        db_corrupt = str(tmp / "corrupt.db")
+        rc, out = run_collector(db_corrupt, base)
+        conn = connect(db_corrupt)
         corrupt = conn.execute(
-            "SELECT reason FROM version_failures WHERE detail LIKE '%registry 第 0 页%' "
+            "SELECT reason FROM version_failures WHERE detail LIKE '%registry/R-1 第 0 页%' "
             "ORDER BY id DESC LIMIT 1").fetchone()
         check("损坏页被校验和/损坏标记识别", corrupt is not None,
               corrupt["reason"] if corrupt else out.strip().splitlines()[-1])
+        check("损坏版本未被激活", get_active_version(conn) is None)
+        conn.close()
+        conn = connect(db)
         check("损坏不影响当前 active(v3) 查询", get_active_version(conn) == "v3")
         conn.close()
         control(base, {"clear_broken": True})
@@ -305,19 +328,162 @@ def main() -> int:
               "重走入口时校验和一致即跳过")
         conn2.close()
 
-        # 9. 会话频繁过期：确定性地每隔一次请求让会话失效，验证重登+续采仍能完成
-        print("\n== 9. 会话频繁过期，自动重登并按已保存页续采 ==")
+        # 9. 分册并行：每站两个翻页名额，暂停仍占名额，两册暂停时第三册能在恢复前采完
+        print("\n== 9. 分册并行、名额争用与暂停让位 ==")
+        control(base, {"entry_versions": {"registry": "v1", "joins": "v1"},
+                       "reset_stats": True, "reset_events": True, "reset_sessions": True,
+                       "page_delay": 0.35})
+        db5 = str(tmp / "slots.db")
+        # 先用两个真实会话分别占住 R-1、R-2 的名额并请求一次，使其进入"暂停中"状态，
+        # 确定性地让两个名额都被暂停会话占用；第三册此时必须触发名额让位才能采集。
+        st = control(base, {"pause_volumes": {"registry:R-1": 4, "registry:R-2": 4}})
+        pause_until = st["volume_paused"]["registry:R-1"]
+        holders = []
+        for vol in ("R-1", "R-2"):
+            hs = http("POST", base + "/session",
+                      f"key=ceramics-local-control&entry=registry&volume={vol}".encode(),
+                      {"Content-Type": "application/x-www-form-urlencoded"})[1]
+            sig = sign(hs["secret"], "GET", "/registry", hs["sid"], hs["first_token"])
+            code, _ = http("GET", base + f"/registry?volume={vol}", headers={
+                "X-Ceramic-Session": hs["sid"], "X-Ceramic-Token": hs["first_token"],
+                "X-Ceramic-Signature": sig})
+            assert code == 503, code   # 该分册暂停，会话仍占名额
+            holders.append(hs)
+        st_hold = site_state(base)
+        check("暂停中的两个会话仍占用每站名额",
+              st_hold["active_sessions"] == 2
+              and {s["state"] for s in st_hold["sessions"]} == {"paused"},
+              f"占位会话 {st_hold['active_sessions']}，状态 "
+              f"{[s['state'] for s in st_hold['sessions']]}")
+
+        bg = subprocess.Popen(
+            [sys.executable, "-m", "ceramics.collector", "run", "--db", db5,
+             "--base-url", base, "--rounds", "1"],
+            cwd=ROOT, env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        r3_done_at = None
+        poll = connect(db5)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                n = poll.execute("SELECT COUNT(*) c FROM pages WHERE entry='registry' "
+                                 "AND volume='R-3'").fetchone()["c"]
+            except sqlite3.OperationalError:
+                n = 0
+            if n >= 2:
+                r3_done_at = time.time()
+                break
+            time.sleep(0.05)
+        poll.close()
+        out5 = bg.communicate(timeout=40)[0]
+        for hs in holders:
+            release(base, hs)
+        st5 = site_state(base)
+        check("第三册(R-3)在两个分册暂停期间即采完",
+              r3_done_at is not None and r3_done_at < pause_until,
+              f"R-3 完成于暂停结束前 {pause_until - r3_done_at:.1f}s"
+              if r3_done_at else "R-3 未在期限内采完")
+        paused_evictions = [e for e in st5["events"]
+                            if e["kind"] == "evict" and e.get("state") == "paused"]
+        check("暂停占用的名额被收回，第三册据此采集",
+              len(paused_evictions) >= 2,
+              f"收回暂停分册名额 {len(paused_evictions)} 次: "
+              f"{[(e.get('volume'), '->', e.get('for_volume')) for e in paused_evictions]}")
+        check("并行翻页用满但不超出每站两个名额",
+              st5["peak_paging"] == st5["slot_limit"] == 2,
+              f"峰值并行翻页 {st5['peak_paging']}，上限 {st5['slot_limit']}")
+        conn5 = connect(db5)
+        check("所有分册同版收齐后激活 v1",
+              get_active_version(conn5) == "v1",
+              f"active={get_active_version(conn5)}，日志末行："
+              f"{out5.strip().splitlines()[-1] if out5.strip() else ''}")
+        per_vol = {r["volume"]: r["n"] for r in conn5.execute(
+            "SELECT volume, COUNT(*) n FROM pages WHERE entry='registry' "
+            "GROUP BY volume")}
+        check("已存正文不重复下载（各分册页数恰好等于清单页数）",
+              per_vol == {"R-1": 2, "R-2": 2, "R-3": 2}, str(per_vol))
+        conn5.close()
+        control(base, {"pause_volumes": {}, "resume_volumes": ["registry:R-1",
+                                                              "registry:R-2"]})
+
+        # 10. 无别册竞争且会话未过期：分册暂停恢复沿用原会话与令牌
+        print("\n== 10. 暂停恢复沿用原会话（无别册等名额） ==")
+        control(base, {"page_delay": 0.0, "reset_events": True})
+        sess = http("POST", base + "/session",
+                    b"key=ceramics-local-control&entry=registry&volume=R-1",
+                    {"Content-Type": "application/x-www-form-urlencoded"})[1]
+        tok = sess["first_token"]
+
+        def vol_get(token):
+            sig = sign(sess["secret"], "GET", "/registry", sess["sid"], token)
+            return http("GET", base + "/registry?volume=R-1", headers={
+                "X-Ceramic-Session": sess["sid"], "X-Ceramic-Token": token,
+                "X-Ceramic-Signature": sig})
+
+        code, first = vol_get(tok)
+        tok = first.get("next_token")
+        control(base, {"pause_volumes": {"registry:R-1": 1}})
+        code_paused, _ = vol_get(tok)
+        time.sleep(1.2)
+        code_resumed, second = vol_get(tok)  # 同一令牌重试
+        st10 = site_state(base)
+        resumed_same = [e for e in st10["events"]
+                        if e["kind"] == "resume_same_session"
+                        and e["sid"] == sess["sid"][:8]]
+        check("分册暂停返回 503，恢复后同令牌同会话继续",
+              code_paused == 503 and code_resumed == 200
+              and second.get("page_index") == 1,
+              f"暂停 {code_paused} → 恢复 {code_resumed} 第 {second.get('page_index')} 页")
+        check("恢复沿用原会话（未重新登录换令牌）", bool(resumed_same),
+              "站点记录 resume_same_session，无新会话签发")
+        release(base, sess)
+        control(base, {"resume_volumes": ["registry:R-1"]})
+
+        # 采集器端到端（单分册、无别册竞争）：只暂停 R-3，恢复后应沿用原会话续采
+        control(base, {"pause_volumes": {"registry:R-3": 1.5}, "reset_events": True})
+        db7 = str(tmp / "same_session.db")
+        init_db(db7)
+        from ceramics import collector as col7
+        pool7 = col7.SlotPool(2)
+        ver7, pages7 = col7.collect_volume(base, db7, "registry", "R-3", "v1", 2, pool7)
+        st7 = site_state(base)
+        same = [e for e in st7["events"] if e["kind"] == "resume_same_session"]
+        login_count = len([e for e in st7["events"] if e["kind"] == "grant"])
+        check("采集器在单册暂停恢复后沿用原会话续采（未重登换令牌）",
+              ver7 == "v1" and pages7 == 2 and bool(same) and login_count == 1,
+              f"resume_same_session {len(same)} 次，会话签发 {login_count} 次，"
+              f"R-3 采到 {pages7} 页")
+        control(base, {"resume_volumes": ["registry:R-3"]})
+
+        # 11. 旧站两入口协议照常工作（无 /manifest 时回退整册翻页）
+        print("\n== 11. 旧站两入口协议兼容 ==")
+        control(base, {"legacy": True, "entry_versions": {"registry": "v1",
+                                                          "joins": "v1"}})
+        db6 = str(tmp / "legacy.db")
+        rc, out6 = run_collector(db6, base)
+        conn6 = connect(db6)
+        check("无分册清单的旧站仍能采集并激活",
+              rc == 0 and get_active_version(conn6) == "v1"
+              and "旧站两入口协议" in out6, out6.strip().splitlines()[-1])
+        legacy_pages = [tuple(r) for r in conn6.execute(
+            "SELECT entry, volume, COUNT(*) FROM pages GROUP BY entry, volume")]
+        check("旧站页面按整册保存（无分册维度）",
+              all(v == "" for _, v, _ in legacy_pages), str(legacy_pages))
+        conn6.close()
+        control(base, {"legacy": False})
+
+        # 12. 会话频繁过期：确定性地每隔一次请求让会话失效，验证重登+续采仍能完成
+        print("\n== 12. 会话频繁过期，自动重登并按已保存页续采 ==")
         control(base, {"entry_versions": {"registry": "v1", "joins": "v1"}})
         from ceramics import collector as col_mod
         db4 = str(tmp / "relogin.db")
         calls = {"n": 0}
         orig_fetch = col_mod.SiteClient.fetch_page
 
-        def patched_fetch(self, entry):
+        def patched_fetch(self, entry, volume=None):
             calls["n"] += 1
             if calls["n"] % 2 == 0:  # 偶数次请求前强制当前会话过期
                 control(base, {"expire_sessions": True})
-            return orig_fetch(self, entry)
+            return orig_fetch(self, entry, volume)
 
         col_mod.SiteClient.fetch_page = patched_fetch
         try:
@@ -331,7 +497,7 @@ def main() -> int:
         conn4.close()
 
         # 10. HTTP 查询服务冒烟
-        print("\n== 10. HTTP 查询服务 ==")
+        print("\n== 13. HTTP 查询服务 ==")
         qport = free_port()
         qsrv = subprocess.Popen(
             [sys.executable, "-m", "ceramics.query", "serve", "--db", db,

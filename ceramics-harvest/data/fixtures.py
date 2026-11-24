@@ -15,6 +15,9 @@ VERSIONS: dict[str, dict] = {
         "layouts": {"registry": "pipe", "joins": "pipe"},
         "page_size": {"registry": 5, "joins": 3},
         "broken_pages": {},
+        # 分册清单（新协议）：登记 3 册、拼接 2 册；每册内再按 volume_page_size 翻页。
+        "volumes": {"registry": ["R-1", "R-2", "R-3"], "joins": ["J-1", "J-2"]},
+        "volume_page_size": {"registry": 2, "joins": 2},
         "registry": [
             {"catalog_no": "C-001", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 312.5},
             {"catalog_no": "C-002", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 288.0},
@@ -40,6 +43,9 @@ VERSIONS: dict[str, dict] = {
         "layouts": {"registry": "jsonl", "joins": "jsonl"},
         "page_size": {"registry": 6, "joins": 4},
         "broken_pages": {},
+        # 分册清单（新协议）：登记 3 册、拼接 2 册；每册内再按 volume_page_size 翻页。
+        "volumes": {"registry": ["R-1", "R-2", "R-3"], "joins": ["J-1", "J-2"]},
+        "volume_page_size": {"registry": 2, "joins": 2},
         "registry": [
             {"catalog_no": "C-001", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 310.1},
             {"catalog_no": "C-002", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 286.8},
@@ -69,6 +75,9 @@ VERSIONS: dict[str, dict] = {
         "page_size": {"registry": 6, "joins": 4},
         # 损坏页可由控制接口动态改写；这里默认完好，验证脚本会现场制造损坏。
         "broken_pages": {},
+        # 分册清单（新协议）：登记 3 册、拼接 2 册；每册内再按 volume_page_size 翻页。
+        "volumes": {"registry": ["R-1", "R-2", "R-3"], "joins": ["J-1", "J-2"]},
+        "volume_page_size": {"registry": 2, "joins": 2},
         "registry": [
             {"catalog_no": "C-001", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 310.1},
             {"catalog_no": "C-002", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 286.8},
@@ -99,6 +108,9 @@ VERSIONS: dict[str, dict] = {
         "layouts": {"registry": "pipe", "joins": "pipe"},
         "page_size": {"registry": 7, "joins": 4},
         "broken_pages": {},
+        # 分册清单（新协议）：登记 3 册、拼接 2 册；每册内再按 volume_page_size 翻页。
+        "volumes": {"registry": ["R-1", "R-2", "R-3"], "joins": ["J-1", "J-2"]},
+        "volume_page_size": {"registry": 2, "joins": 2},
         "registry": [
             {"catalog_no": "C-001", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 310.1},
             {"catalog_no": "C-002", "museum": "合作馆甲", "material": "夹砂陶", "weight_g": 286.8},
