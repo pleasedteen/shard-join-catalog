@@ -358,6 +358,170 @@ def main() -> int:
             qsrv.terminate()
             qsrv.wait(timeout=5)
 
+        # 11. 整版之间只发更正单：新增/改写/删除、漏版本地补齐、重启续采、小更正
+        print("\n== 11. 更正单发布：漏版本地补齐、重启续采与小更正 ==")
+        # 11.0 先采集更正单的基版整版 v5
+        control(base, {"entry_versions": {"registry": "v5", "joins": "v5"}})
+        rc, out = run_collector(db, base)
+        conn = connect(db)
+        check("采集并激活基版整版 v5", rc == 0 and get_active_version(conn) == "v5",
+              out.strip().splitlines()[-1])
+        v5_pages = conn.execute(
+            "SELECT COUNT(*) c FROM pages WHERE version='v5'").fetchone()["c"]
+        v5_sherds = conn.execute(
+            "SELECT COUNT(*) c FROM sherds WHERE version='v5'").fetchone()["c"]
+        check("基版整版全量落库（4 页 / 12 条登记）", v5_pages == 4 and v5_sherds == 12,
+              f"pages={v5_pages}, sherds={v5_sherds}")
+        conn.close()
+
+        # 11.1 错时：只切登记入口到更正单 c1，两入口目标版不一致期间不切换、继续提供原版
+        control(base, {"entry_versions": {"registry": "c1"}})
+        rc, out = run_collector(db, base)
+        conn = connect(db)
+        check("只有登记入口到达更正单时查询仍为基版 v5",
+              get_active_version(conn) == "v5", out.strip().splitlines()[-1])
+        conn.close()
+
+        # 11.2 拼接入口也到达 c1：两份清单同目标版且引用完整后原子切换到 v6
+        control(base, {"entry_versions": {"joins": "c1"}})
+        rc, out = run_collector(db, base)
+        conn = connect(db)
+        check("两份更正单到达同一目标版 v6 后原子激活",
+              rc == 0 and get_active_version(conn) == "v6", out.strip().splitlines()[-1])
+        # 传输/落库规模：更正单只有 3+3 条变化记录（每页 2 条 => 各 2 页，共 4 页）
+        v6_pages = conn.execute(
+            "SELECT COUNT(*) c FROM pages WHERE version='v6'").fetchone()["c"]
+        v6_sherds = conn.execute(
+            "SELECT COUNT(*) c FROM sherds WHERE version='v6'").fetchone()["c"]
+        v6_joins = conn.execute(
+            "SELECT COUNT(*) c FROM joins WHERE version='v6'").fetchone()["c"]
+        check("更正单传输页数只随更正规模增长（v6 仅 4 张更正页）", v6_pages == 4,
+              f"v6 更正页 {v6_pages} 张")
+        check("更正版不落全量登记/拼接（sherds/joins 无 v6 记录）",
+              v6_sherds == 0 and v6_joins == 0,
+              f"sherds={v6_sherds}, joins={v6_joins}，全量视图查询时沿谱系本地物化")
+        lineage = {r["target_version"]: r["base_version"] for r in conn.execute(
+            "SELECT target_version, base_version FROM edition_lineage")}
+        check("更正谱系登记 v6 <- v5", lineage.get("v6") == "v5", str(lineage))
+
+        # 11.3 物化解说：改写/新增/删除分别生效
+        r001 = query_mod.find_sherd(conn, "C-001")
+        check("登记改写生效：C-001 重量更新为 318.8",
+              r001["sherd"]["weight_g"] == 318.8, f"实际 {r001['sherd']['weight_g']}")
+        r013 = query_mod.find_sherd(conn, "C-013")
+        check("登记新增生效：C-013 可查并经新拼接并入 B 组（5 片）",
+              r013["version"] == "v6" and r013["group_size"] == 5,
+              f"C-013 组: {[m['catalog_no'] for m in r013['group']]}")
+        try:
+            query_mod.find_sherd(conn, "C-009")
+            deleted_ok = False
+        except LookupError:
+            deleted_ok = True
+        check("登记删除生效：C-009 已从目标版移除", deleted_ok)
+        r007 = query_mod.find_sherd(conn, "C-007")
+        r008 = query_mod.find_sherd(conn, "C-008")
+        check("拼接删除生效：C-007/C-008 各自孤立",
+              r007["group_size"] == 1 and r008["group_size"] == 1)
+        r005 = query_mod.find_sherd(conn, "C-005")
+        rewritten = [e for e in r005["effective_joins"]
+                     if e["edge_key"] == "C-005~C-006"][0]
+        check("拼接改写生效：C-005~C-006 粘接说明与置信度更新",
+              rewritten["bond"] == "拼接-B 腹部（复核修正）"
+              and rewritten["confidence"] == "high",
+              f"{rewritten['bond']} / {rewritten['confidence']}")
+        check("拼接新增生效：C-012~C-013 在有效拼接中",
+              any(e["edge_key"] == "C-012~C-013" for e in r013["effective_joins"]))
+        groups6 = query_mod.list_groups(conn)
+        check("v6 全文仍可物化并分为 5 个连通组（含两个孤立片与 C-011）",
+              groups6["group_count"] == 5, str([g for g in groups6["groups"]]))
+        conn.close()
+
+        # 11.4 问题更正单：引用不完整 / 基版缺失，都被拦截且旧版继续可查
+        control(base, {"entry_versions": {"registry": "c-bad-ref", "joins": "c-bad-ref"}})
+        rc, out = run_collector(db, base)
+        conn = connect(db)
+        bad = conn.execute(
+            "SELECT reason, detail FROM version_failures WHERE version='v8-bad' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        check("引用不完整的更正单被拦截，查询仍为 v6",
+              get_active_version(conn) == "v6" and bad is not None
+              and "Y-007" in (bad["detail"] or ""),
+              f"{bad['reason'] if bad else '无失败记录'}: {bad['detail'] if bad else ''}")
+        conn.close()
+        control(base, {"entry_versions": {"registry": "c-orphan", "joins": "c-orphan"}})
+        rc, out = run_collector(db, base)
+        conn = connect(db)
+        orphan = conn.execute(
+            "SELECT reason, detail FROM version_failures WHERE version='v9-orphan' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        check("基版本地不存在的更正单被拦截，查询仍为 v6",
+              get_active_version(conn) == "v6" and orphan is not None
+              and "v-ghost" in (orphan["detail"] or ""),
+              f"{orphan['reason'] if orphan else '无失败记录'}: "
+              f"{orphan['detail'] if orphan else ''}")
+        conn.close()
+
+        # 11.5 漏版 + 重启：站点直接发小更正 c2（v6->v7），合作馆不再重发任何整版；
+        #       采集进程被杀后重启，复用已确认更正页续采，链式从本地 v5 整版补齐到 v7
+        control(base, {"entry_versions": {"registry": "c2", "joins": "c2"},
+                       "pause_seconds": 3})
+        killed2 = subprocess.Popen(
+            [sys.executable, "-m", "ceramics.collector", "run", "--db", db,
+             "--base-url", base, "--rounds", "1"],
+            cwd=ROOT, env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        conn = connect(db)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM pages WHERE version='v7'").fetchone()["c"]
+            if n > 0:  # 至少一张更正页已确认落盘
+                break
+            time.sleep(0.2)
+        v7_partial = conn.execute(
+            "SELECT COUNT(*) c FROM pages WHERE version='v7'").fetchone()["c"]
+        conn.close()
+        killed2.kill()
+        killed2.wait()
+        check("重启前已有更正页确认落盘", v7_partial > 0, f"已保存 v7 更正页 {v7_partial} 张")
+        rc, out3 = run_collector(db, base)
+        conn = connect(db)
+        check("重启后复用已确认更正页续采并激活 v7",
+              rc == 0 and get_active_version(conn) == "v7" and "断点续采" in out3,
+              out3.strip().splitlines()[-1])
+        v7_pages = conn.execute(
+            "SELECT COUNT(*) c FROM pages WHERE version='v7'").fetchone()["c"]
+        v7_bulk = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM sherds WHERE version='v7') + "
+            "(SELECT COUNT(*) FROM joins WHERE version='v7') AS c").fetchone()["c"]
+        check("小更正只传 2 张更正页、不产生全量落库", v7_pages == 2 and v7_bulk == 0,
+              f"v7 更正页 {v7_pages} 张，全量落库 {v7_bulk} 条")
+        kinds = {r["version"]: r["kind"] for r in conn.execute(
+            "SELECT version, kind FROM versions WHERE version IN ('v6','v7')")}
+        check("v6/v7 从未发布整版，本地仅靠更正页补齐（漏版可补）",
+              kinds == {"v6": "correction", "v7": "correction"}, str(kinds))
+        lineage = {r["target_version"]: r["base_version"] for r in conn.execute(
+            "SELECT target_version, base_version FROM edition_lineage")}
+        check("链式更正谱系 v7 <- v6 <- v5 完整",
+              lineage.get("v7") == "v6" and lineage.get("v6") == "v5", str(lineage))
+        r011 = query_mod.find_sherd(conn, "C-011")
+        check("链式物化生效：C-011 重量按小更正改写为 160.2",
+              r011["sherd"]["weight_g"] == 160.2, f"实际 {r011['sherd']['weight_g']}")
+        check("小更正新增拼接并入 B 组（6 片）",
+              r011["group_size"] == 6 and
+              "C-011~C-012" in [e["edge_key"] for e in r011["effective_joins"]],
+              f"C-011 组: {[m['catalog_no'] for m in r011['group']]}")
+        from ceramics.materialize import materialize
+        mat_reg, mat_joins = materialize(conn, "v7")
+        check("漏版补齐后物化视图完整（12 片登记、8 条拼接边）",
+              len(mat_reg) == 12 and len(mat_joins) == 8,
+              f"物化登记 {len(mat_reg)} 条 / 拼接 {len(mat_joins)} 条")
+        # 撤销在更正版上同样按目标版隔离工作
+        query_mod.revoke_join(conn, "C-011", "C-012", reason="更正版复核撤销演示")
+        after_rev = query_mod.find_sherd(conn, "C-011")
+        check("更正版上撤销拼接后连通组实时拆分", after_rev["group_size"] == 1,
+              f"C-011 组: {[m['catalog_no'] for m in after_rev['group']]}")
+        conn.close()
+
     finally:
         server.terminate()
         try:

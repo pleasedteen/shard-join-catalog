@@ -2,6 +2,8 @@
 
 行为覆盖需求中的全部站点故障与协议特性：
 - 两个入口 /registry 和 /joins 可在*不同时间*切到不同发布版（控制接口单独设置）。
+  发布版既可以是整版，也可以是只含 add/upsert/delete 的更正单（kind=correction），
+  更正单携带 base_version/target_version，站点不再重发整版数据。
 - 会话有 TTL，过期后返回 401；站点可暂停受理，暂停期返回 503 + Retry-After 恢复时间。
 - 翻页令牌按会话访问顺序发放，令牌绑定会话与游标；新会话无法使用旧令牌。
 - 请求签名随会话 secret 和令牌变化。
@@ -26,14 +28,16 @@ ENTRIES = ("registry", "joins")
 
 def _format_page(records: list[dict], layout: str) -> str:
     if layout == "pipe":
-        lines = ["|".join(str(v) for v in row.values()) for row in records]
+        lines = ["|".join("" if v is None else str(v) for v in row.values())
+                 for row in records]
         return "\n".join(lines)
     if layout == "jsonl":
         return "\n".join(json.dumps(row, ensure_ascii=False) for row in records)
     if layout == "record":
         blocks = []
         for row in records:
-            blocks.append("\n".join(f"{k}: {v}" for k, v in row.items()))
+            blocks.append("\n".join(f"{k}: {'' if v is None else v}"
+                                    for k, v in row.items()))
         return "\n\n".join(blocks)
     raise ValueError(f"未知排版: {layout}")
 
@@ -67,10 +71,13 @@ STATE = SiteState()
 
 def _page_payload(entry: str, version: str, index: int) -> dict:
     spec = VERSIONS[version]
+    kind = spec.get("kind", "full")
     size = spec["page_size"][entry]
-    rows = spec[entry][index * size:(index + 1) * size]
-    total = (len(spec[entry]) + size - 1) // size
-    broken = index in STATE.broken_pages.get((entry, version), [])
+    source = spec["corrections"][entry] if kind == "correction" else spec[entry]
+    rows = source[index * size:(index + 1) * size]
+    total = (len(source) + size - 1) // size
+    broken_key = (entry, version)
+    broken = index in STATE.broken_pages.get(broken_key, [])
     if broken:
         # 损坏页：内容被截断、校验和按完好内容计算，必然对不上
         body = _format_page(rows, spec["layouts"][entry])
@@ -79,8 +86,9 @@ def _page_payload(entry: str, version: str, index: int) -> dict:
     else:
         body = _format_page(rows, spec["layouts"][entry])
         checksum = page_checksum(rows)
-    return {
+    payload = {
         "entry": entry,
+        "kind": kind,
         "version": version,
         "page_index": index,
         "total_pages": total,
@@ -90,6 +98,11 @@ def _page_payload(entry: str, version: str, index: int) -> dict:
         "checksum": checksum,
         "body": body,
     }
+    if kind == "correction":
+        # 更正单：页面按目标版编号归档，基版用于采集端本地补齐
+        payload["target_version"] = spec["target_version"]
+        payload["base_version"] = spec["base_version"]
+    return payload
 
 
 class Handler(BaseHTTPRequestHandler):

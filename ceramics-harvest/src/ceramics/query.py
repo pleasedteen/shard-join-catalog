@@ -1,9 +1,12 @@
 """查询服务：按当前 active 发布版返回陶片及其拼接连通组，支持撤销/恢复拼接。
 
-- 有效拼接 = 该发布版 joins 去掉本发布版 revocations；撤销后原一组自动拆成多组，
+- 整版直接读 sherds/joins；更正单不落全量数据，由 ceramics.materialize 沿更正谱系
+  从本地整版 + 已确认更正页实时物化（漏过中间版也能在本地补齐）。
+- 有效拼接 = 目标版物化拼接去掉本发布版 revocations；撤销后原一组自动拆成多组，
   由图遍历实时计算（自动成环也安全）。
 - 查询结果带发布版编号，明确数据来自哪一版。
 - 没有任何 active 版本时明确报错，不猜测数据。
+- 补采/校验期间 active 不切换，查询始终命中已确认版本，不会读到半成品。
 """
 from __future__ import annotations
 
@@ -17,36 +20,58 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from ceramics.db import connect, get_active_version, init_db
-
-EFFECTIVE_EDGES_SQL = """
-SELECT j.edge_key, j.a, j.b, j.bond, j.confidence
-FROM joins j
-WHERE j.version = ?
-  AND NOT EXISTS (
-      SELECT 1 FROM revocations r
-      WHERE r.version = j.version AND r.edge_key = j.edge_key)
-"""
+from ceramics.materialize import MaterializeError, materialize
+from ceramics.protocol import edge_key
 
 
-def _load_graph(conn: sqlite3.Connection, version: str) -> tuple[dict, dict]:
+def _is_correction(conn: sqlite3.Connection, version: str) -> bool:
+    row = conn.execute("SELECT kind FROM versions WHERE version=?", (version,)).fetchone()
+    return bool(row and row["kind"] == "correction")
+
+
+def _load_active_dataset(conn: sqlite3.Connection, version: str) -> tuple[list[dict], list[dict]]:
+    """返回当前 active 版本的 (登记记录, 拼接记录)。
+
+    整版读已落库的 sherds/joins；更正版按谱系从本地整版与更正页物化。
+    """
+    if _is_correction(conn, version):
+        try:
+            return materialize(conn, version)
+        except MaterializeError as exc:  # 理论上激活前已拦截，这里兜底
+            raise LookupError(f"目标版 {version} 无法从本地补齐: {exc}")
+    registry_rows = [dict(r) for r in conn.execute(
+        "SELECT catalog_no, museum, material, weight_g FROM sherds "
+        "WHERE version=? ORDER BY catalog_no", (version,))]
+    join_rows = [dict(r) for r in conn.execute(
+        "SELECT edge_key, a, b, bond, confidence FROM joins WHERE version=?",
+        (version,))]
+    return registry_rows, join_rows
+
+
+def _load_graph(conn: sqlite3.Connection, version: str) -> tuple[dict, dict, list[dict]]:
+    registry_rows, join_rows = _load_active_dataset(conn, version)
+    revoked = {r["edge_key"] for r in conn.execute(
+        "SELECT edge_key FROM revocations WHERE version=?", (version,))}
     adj: dict[str, list[dict]] = {}
     edges: dict[str, dict] = {}
-    for row in conn.execute(EFFECTIVE_EDGES_SQL, (version,)):
+    for row in join_rows:
+        if row["edge_key"] in revoked:
+            continue
         edges[row["edge_key"]] = dict(row)
         adj.setdefault(row["a"], []).append({"to": row["b"], "edge_key": row["edge_key"]})
         adj.setdefault(row["b"], []).append({"to": row["a"], "edge_key": row["edge_key"]})
-    return adj, edges
+    return adj, edges, registry_rows
 
 
 def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
     version = get_active_version(conn)
     if not version:
         raise LookupError("尚无完整可用的发布版，查询未开放")
-    sherd = conn.execute("SELECT * FROM sherds WHERE version=? AND catalog_no=?",
-                         (version, catalog_no)).fetchone()
+    adj, edges, registry_rows = _load_graph(conn, version)
+    sherds_by_no = {r["catalog_no"]: r for r in registry_rows}
+    sherd = sherds_by_no.get(catalog_no)
     if not sherd:
         raise LookupError(f"馆藏编号 {catalog_no} 不在当前发布版 {version} 中")
-    adj, edges = _load_graph(conn, version)
     group, visited_edges = [], set()
     queue = deque([catalog_no])
     seen = {catalog_no}
@@ -58,11 +83,7 @@ def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
             if link["to"] not in seen:
                 seen.add(link["to"])
                 queue.append(link["to"])
-    members = []
-    for no in sorted(group):
-        row = conn.execute("SELECT * FROM sherds WHERE version=? AND catalog_no=?",
-                           (version, no)).fetchone()
-        members.append(dict(row) if row else {"catalog_no": no})
+    members = [sherds_by_no[no] for no in sorted(group) if no in sherds_by_no]
     return {
         "query": catalog_no,
         "version": version,
@@ -70,20 +91,23 @@ def find_sherd(conn: sqlite3.Connection, catalog_no: str) -> dict:
             "SELECT published_at FROM versions WHERE version=?", (version,)).fetchone()[0],
         "sherd": dict(sherd),
         "group_size": len(members),
-        "group": members,
+        "group": [dict(m) for m in members],
         "effective_joins": [edges[k] for k in sorted(visited_edges)],
     }
+
+
+def _edge_exists(conn: sqlite3.Connection, version: str, key: str) -> bool:
+    """当前版本（含更正物化）中是否存在该拼接边。"""
+    _, join_rows = _load_active_dataset(conn, version)
+    return any(r["edge_key"] == key for r in join_rows)
 
 
 def revoke_join(conn: sqlite3.Connection, a: str, b: str, reason: str = "") -> dict:
     version = get_active_version(conn)
     if not version:
         raise LookupError("尚无完整可用的发布版")
-    from ceramics.protocol import edge_key
     key = edge_key(a, b)
-    row = conn.execute("SELECT * FROM joins WHERE version=? AND edge_key=?",
-                       (version, key)).fetchone()
-    if not row:
+    if not _edge_exists(conn, version, key):
         raise LookupError(f"当前发布版 {version} 中不存在拼接 {a}~{b}")
     conn.execute(
         "INSERT INTO revocations(version, edge_key, reason, revoked_at) "
@@ -98,7 +122,6 @@ def restore_join(conn: sqlite3.Connection, a: str, b: str) -> dict:
     version = get_active_version(conn)
     if not version:
         raise LookupError("尚无完整可用的发布版")
-    from ceramics.protocol import edge_key
     key = edge_key(a, b)
     cur = conn.execute("DELETE FROM revocations WHERE version=? AND edge_key=?",
                        (version, key))
@@ -112,9 +135,8 @@ def list_groups(conn: sqlite3.Connection) -> dict:
     version = get_active_version(conn)
     if not version:
         raise LookupError("尚无完整可用的发布版，查询未开放")
-    adj, _ = _load_graph(conn, version)
-    nodes = [r["catalog_no"] for r in conn.execute(
-        "SELECT catalog_no FROM sherds WHERE version=? ORDER BY catalog_no", (version,))]
+    adj, _, registry_rows = _load_graph(conn, version)
+    nodes = [r["catalog_no"] for r in registry_rows]
     groups, seen = [], set()
     for start in nodes:
         if start in seen:
@@ -135,13 +157,15 @@ def list_groups(conn: sqlite3.Connection) -> dict:
 
 def status(conn: sqlite3.Connection) -> dict:
     version = get_active_version(conn)
-    out = {"active_version": version, "revisions": [], "history": []}
+    out = {"active_version": version, "revisions": [], "history": [], "lineage": []}
     if version:
         out["revisions"] = [dict(r) for r in conn.execute(
             "SELECT edge_key, reason, revoked_at FROM revocations WHERE version=? ORDER BY id",
             (version,))]
         out["history"] = [dict(r) for r in conn.execute(
             "SELECT version, activated_at FROM activation_log ORDER BY id")]
+        out["lineage"] = [dict(r) for r in conn.execute(
+            "SELECT target_version, base_version FROM edition_lineage ORDER BY target_version")]
     return out
 
 

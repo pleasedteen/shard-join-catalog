@@ -52,7 +52,7 @@ case "${1:-}" in
     cat <<EOF
 用法: ./run.sh <命令>
 
-  verify        一键本地验证（80 秒内输出全部场景结果）
+  verify        一键本地验证（80 秒内输出全部场景，含更正单漏版/重启/小更正）
   site          启动模拟站        :$PORT_SITE
   collect-once  执行一轮采集并按规则激活版本
   collect       持续采集（可加 --rounds N --interval 秒）
